@@ -22,8 +22,8 @@ RUN set -xe \
     gettext build-essential \
     libxml2-dev libxslt1-dev zlib1g-dev git \
     libjpeg-dev libffi-dev libssl-dev libxslt1.1 \
-    libmariadb3 mariadb-client \
-    optipng zip \
+    libmariadb3 mariadb-client postgresql \
+    optipng nodejs zip \
     # python
     && python -m venv /venv \
     && pip install --upgrade pip==${PIP_VERSION} \

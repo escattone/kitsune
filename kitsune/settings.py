@@ -67,6 +67,11 @@ DATABASES = {
     "default": config("DATABASE_URL", cast=dj_database_url.parse),
 }
 
+# This is temporary and will be removed once we've migrated to Postgres.
+POSTGRES_DATABASE_URL = config("POSTGRES_DATABASE_URL", default=None)
+if POSTGRES_DATABASE_URL:
+    DATABASES["postgres"] = dj_database_url.parse(POSTGRES_DATABASE_URL)
+
 if DATABASES["default"]["ENGINE"] == "django.db.backends.mysql":
     DATABASES["default"]["CONN_MAX_AGE"] = DB_CONN_MAX_AGE
     DATABASES["default"]["OPTIONS"] = {"init_command": "SET default_storage_engine=InnoDB"}
