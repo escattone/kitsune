@@ -1,0 +1,52 @@
+LOAD DATABASE
+    FROM      mysql://sumo:pwd@172.16.16.242/support_mozilla_com
+    INTO postgresql://sumo:pwd@172.16.16.239/sumo_prod
+
+    EXCLUDING TABLE NAMES MATCHING 'django_session',
+                                   'auth_message',
+                                   'axes_accessattempt',
+                                   'axes_accesslog',
+                                   'badger_badge_prerequisites',
+                                   'badger_deferredaward',
+                                   'badger_nomination',
+                                   'badger_progress',
+                                   'celery_taskmeta',
+                                   'celery_tasksetmeta',
+                                   'corsheaders_corsmodel',
+                                   'djcelery_crontabschedule',
+                                   'djcelery_intervalschedule',
+                                   'djcelery_periodictask',
+                                   'djcelery_periodictasks',
+                                   'djcelery_taskstate',
+                                   'djcelery_workerstate',
+                                   'schema_version',
+                                   'sessions',
+                                   'south_migrationhistory'
+
+    WITH truncate,
+         data only,
+         create no tables,
+         include no drop,
+         create no indexes,
+         no foreign keys,
+         disable triggers,
+         preserve index names,
+         reset sequences,
+         workers = 4,
+         concurrency = 1,
+         batch rows = 25000,
+         prefetch rows = 100000
+
+    CAST COLUMN actstream_action.data TO jsonb,
+         COLUMN tidings_watch.secret TO varchar keep typemod using remove-null-characters,
+         COLUMN tidings_watchfilter.value TO bigint drop typemod,
+         COLUMN django_admin_log.action_flag TO smallint drop typemod,
+         COLUMN users_accountevent.status TO smallint drop typemod,
+         type int with extra auto_increment to integer,
+         type integer with extra auto_increment to integer,
+         type int when unsigned to integer drop typemod,
+         type integer when unsigned to integer drop typemod,
+         type int TO integer,
+         type integer TO integer
+
+    ALTER SCHEMA 'support_mozilla_com' RENAME TO 'public';
