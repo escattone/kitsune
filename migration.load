@@ -29,13 +29,15 @@ LOAD DATABASE
          include no drop,
          create no indexes,
          no foreign keys,
-         disable triggers,
          preserve index names,
          reset sequences,
          workers = 4,
          concurrency = 1,
-         batch rows = 25000,
-         prefetch rows = 100000
+         batch rows = 5000,
+         prefetch rows = 20000
+
+    SET PostgreSQL PARAMETERS
+         session_replication_role = 'replica'
 
     CAST COLUMN actstream_action.data TO jsonb,
          COLUMN tidings_watch.secret TO varchar keep typemod using remove-null-characters,

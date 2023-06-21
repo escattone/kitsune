@@ -22,7 +22,7 @@ RUN set -xe \
     gettext build-essential \
     libxml2-dev libxslt1-dev zlib1g-dev git \
     libjpeg-dev libffi-dev libssl-dev libxslt1.1 \
-    libmariadb3 mariadb-client postgresql \
+    libmariadb3 mariadb-client postgresql pgloader vim time procps \
     optipng nodejs zip \
     # python
     && python -m venv /venv \
@@ -105,7 +105,7 @@ RUN apt-get update && \
     apt-get upgrade -y && \
     apt-get install -y --no-install-recommends \
     libmariadb3 optipng mariadb-client \
-    libxslt1.1 && \
+    libxslt1.1 postgresql pgloader vim time procps && \
     rm -rf /var/lib/apt/lists/*
 
 RUN mkdir /app/media && chown kitsune:kitsune /app/media
