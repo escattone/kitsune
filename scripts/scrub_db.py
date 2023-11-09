@@ -30,6 +30,14 @@ def run(*args):
         )
         print(f"{model}.{field_name}: {num_rows} rows scrubbed")
 
+    # Ensure that "Question.num_votes_past_week" is never null.
+    num_rows = (
+        Question.objects.using(database_alias)
+        .filter(num_votes_past_week__isnull=True)
+        .update(num_votes_past_week=0)
+    )
+    print(f"Question.num_votes_past_week: {num_rows} rows scrubbed")
+
     # Ensure that "FlaggedObject.reason" is never null.
     num_rows = (
         FlaggedObject.objects.using(database_alias)
