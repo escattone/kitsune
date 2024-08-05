@@ -1,3 +1,4 @@
+import json
 import logging
 from datetime import date
 from typing import Dict, List
@@ -13,9 +14,11 @@ from django.core.mail import mail_admins
 from django.db import transaction
 from django.urls import reverse as django_reverse
 from django.utils.translation import gettext as _
+from django_celery_beat.models import IntervalSchedule, PeriodicTask
 from requests.exceptions import HTTPError
 from sentry_sdk import capture_exception
 
+from kitsune.celery import app as celery_app
 from kitsune.kbadge.utils import get_or_create_badge
 from kitsune.sumo import email_utils
 from kitsune.sumo.decorators import skip_if_read_only_mode
@@ -32,6 +35,26 @@ from kitsune.wiki.models import (
 from kitsune.wiki.utils import generate_short_url
 
 log = logging.getLogger("k.task")
+
+
+@celery_app.on_after_finalize.connect
+def define_periodic_tasks(app, **kwargs):
+    print("RYAN: Running define_periodic_tasks")
+    schedule, created = IntervalSchedule.objects.get_or_create(
+        every=4,
+        period=IntervalSchedule.HOURS,
+    )
+    task, created = PeriodicTask.objects.get_or_create(
+        interval=schedule,
+        name="Ryan's Test",
+        task="kitsune.wiki.tasks.ryan",
+        kwargs=json.dumps(dict(arg="Testing!")),
+    )
+
+
+@shared_task
+def ryan(arg):
+    print(f"RYAN: arg={arg}")
 
 
 @shared_task

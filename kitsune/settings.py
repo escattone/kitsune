@@ -643,6 +643,7 @@ INSTALLED_APPS: tuple[str, ...] = (
     "django.contrib.messages",
     "django.contrib.staticfiles",
     "django_jinja.contrib._humanize",
+    "django_celery_beat",
     "graphene_django",
     "mozilla_django_oidc",
     "corsheaders",
@@ -896,6 +897,7 @@ CELERY_TASK_EAGER_PROPAGATES = config(
 CELERY_WORKER_HIJACK_ROOT_LOGGER = config(
     "CELERY_WORKER_HIJACK_ROOT_LOGGER", default=False, cast=bool
 )
+CELERY_BEAT_SCHEDULER = "django_celery_beat.schedulers:DatabaseScheduler"
 
 # Wiki rebuild settings
 WIKI_REBUILD_TOKEN = "sumo:wiki:full-rebuild"
