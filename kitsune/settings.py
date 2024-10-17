@@ -354,6 +354,27 @@ DB_LOCALIZE = {
     },
 }
 
+SUMO_L10N_LLM = config("SUMO_L10N_LLM", default="gemini-1.5-pro-002")
+SUMO_L10N_LOCALES_WITH_MACHINE_TRANSLATION = set(
+    (
+        "de",
+        "el",
+        "es",
+        "ja",
+        "pt-BR",
+        "ro",
+    )
+)
+SUMO_L10N_HEARTBEAT_PERIOD = config("SUMO_L10N_HEARTBEAT_PERIOD", default="60 minutes")
+# The grace period (in minutes) provided for the machine translation
+# to be reviewed, after which it will be automatically approved.
+SUMO_L10N_REVIEW_GRACE_PERIOD = config("SUMO_L10N_REVIEW_GRACE_PERIOD", default="3 days")
+# The grace period (in minutes) provided after the machine translation
+# has been reviewed and rejected, after which the machine translation
+# will be automatically approved if no other translation has been
+# approved within that period.
+SUMO_L10N_POST_REVIEW_GRACE_PERIOD = config("SUMO_L10N_POST_REVIEW_GRACE_PERIOD", default="3 days")
+
 # locale is in the kitsune git repo project directory, so that's
 # up one directory from the PROJECT_ROOT
 if config("SET_LOCALE_PATHS", default=True, cast=bool):
@@ -635,6 +656,7 @@ INSTALLED_APPS: tuple[str, ...] = (
     "django.contrib.sites",
     "django.contrib.messages",
     "django.contrib.staticfiles",
+    "django_celery_beat",
     "django_jinja",
     "graphene_django",
     "mozilla_django_oidc",
@@ -674,6 +696,7 @@ INSTALLED_APPS: tuple[str, ...] = (
     "kitsune.notifications",
     "kitsune.journal",
     "kitsune.tidings",
+    "kitsune.l10n",
     "wagtail.contrib.forms",
     "wagtail.contrib.redirects",
     "wagtail.embeds",
@@ -889,6 +912,7 @@ CELERY_TASK_EAGER_PROPAGATES = config(
 CELERY_WORKER_HIJACK_ROOT_LOGGER = config(
     "CELERY_WORKER_HIJACK_ROOT_LOGGER", default=False, cast=bool
 )
+CELERY_BEAT_SCHEDULER = "django_celery_beat.schedulers:DatabaseScheduler"
 
 # Wiki rebuild settings
 WIKI_REBUILD_TOKEN = "sumo:wiki:full-rebuild"

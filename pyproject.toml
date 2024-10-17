@@ -92,6 +92,9 @@ wagtail = "6.2.2"
 wagtail-localize = "1.9"
 django-silk = "^5.1.0"
 requests = "^2.32.3"
+langchain-openai = "^0.2.3"
+langchain-google-vertexai = "^2.0.5"
+django-celery-beat = "^2.7.0"
 
 [tool.poetry.group.dev.dependencies]
 ipdb = "^0.13.11"
