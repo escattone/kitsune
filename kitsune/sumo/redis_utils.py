@@ -116,6 +116,12 @@ class RateLimit:
         self.max_calls = int(max_calls)
         self.period = self.ALLOWED_PERIODS[period]
 
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        self.close()
+
     @cached_property
     def redis(self):
         """
@@ -141,7 +147,7 @@ class RateLimit:
             # Remove the cached Redis client.
             delattr(self, "redis")
 
-    def is_rate_limited(self):
+    def is_rate_limited(self, reserve: int = 1):
         """
         Returns True if the rate limit has been exceeded, False otherwise.
         """
@@ -156,16 +162,16 @@ class RateLimit:
         self.redis.set(self.key, self.max_calls, nx=True, ex=self.period)
         # If the "token bucket" is empty, start rate limiting until it's refreshed
         # again after the period expires.
-        return self.redis.decrby(self.key, 1) < 0
+        return self.redis.decrby(self.key, reserve) < 0
 
-    def wait(self):
+    def wait(self, reserve: int = 1):
         """
         Wait until we're no longer rate limited. Waits either indefinitely, if
         the "max_wait_period" is None or zero, or until the "max_wait_period"
         has been reached. Returns the time spent waiting in seconds.
         """
-        waited = 0
-        while self.is_rate_limited():
+        waited = 0.0
+        while self.is_rate_limited(reserve=reserve):
             jittered_wait = self.wait_period * random.uniform(1 - self.jitter, 1 + self.jitter)
             time.sleep(jittered_wait)
             waited += jittered_wait

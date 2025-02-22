@@ -10,18 +10,32 @@ from django.test.client import RequestFactory
 from django.utils import translation
 from premailer import transform
 
+from kitsune.sumo.redis_utils import RateLimit
+from kitsune.sumo.utils import batched
+
 
 log = logging.getLogger("k.email")
 
 
 def send_messages(messages):
-    """Sends a a bunch of EmailMessages."""
+    """Sends a bunch of EmailMessages."""
     if not messages:
         return
 
-    with mail.get_connection(fail_silently=True) as conn:
-        for msg in messages:
-            conn.send_messages([msg])
+    with RateLimit(
+        key="rate-limit-emails", rate="100/sec", wait_period=1, max_wait_period=30
+    ) as rate_limiter:
+        for batch in batched(messages, 50):
+            # Wait until we can guarantee this batch of calls will
+            # run without exceeding the rate limit. It's important
+            # that we wait while we're not connected to the email
+            # server, so we don't trigger SMTPServerDisconnected
+            # and/or SMTPSenderRefused errors due to the connection
+            # timing out.
+            rate_limiter.wait(reserve=len(batch))
+            with mail.get_connection(fail_silently=True) as conn:
+                for msg in batch:
+                    conn.send_messages([msg])
 
 
 def safe_translation(f):
