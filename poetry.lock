@@ -990,17 +990,6 @@ jinja2 = ["jinja2 (>=2.9.6)"]
 tests = ["jinja2 (>=2.9.6)", "pytest", "pytest-cov", "pytest-django", "pytest-ruff"]
 
 [[package]]
-name = "django-email-bandit"
-version = "2.0"
-description = "django-email-bandit is a Django email backend for hijacking email sending in a test environment."
-optional = false
-python-versions = "*"
-files = [
-    {file = "django-email-bandit-2.0.tar.gz", hash = "sha256:676174702b57d1e1f4d74e507fc6bc0e6292e3af08f20088dc4f859614710706"},
-    {file = "django_email_bandit-2.0-py2.py3-none-any.whl", hash = "sha256:22b0a3ebf2ac19051facc2148df338f353a749d9e3e3bce6551fffcbbe049d0a"},
-]
-
-[[package]]
 name = "django-enforce-host"
 version = "1.1.0"
 description = "Middleware to redirect requests to a canonical hostname"
@@ -5093,4 +5082,4 @@ testing = ["coverage (>=5.0.3)", "zope.event", "zope.testing"]
 [metadata]
 lock-version = "2.0"
 python-versions = "^3.11"
-content-hash = "37901cfca48b2d5cb30e6e5142f4a3fbe3e05a0bff69566f88e73f12952b3615"
+content-hash = "011baee2941664dec29454acd6bbff17c676b19df8bb69eb080eb94d952fbfce"
