@@ -2,7 +2,7 @@ from django.conf import settings
 from django.contrib.auth.models import Group, User
 
 from kitsune.users.handlers import UserDeletionListener
-from kitsune.wiki.models import Document, Revision
+from kitsune.wiki.models import Document, HelpfulVote, Revision
 
 
 class DocumentListener(UserDeletionListener):
@@ -24,3 +24,8 @@ class DocumentListener(UserDeletionListener):
             raise ValueError("SumoBot user not found")
         else:
             Revision.objects.filter(creator=user).update(creator=sumo_bot)
+            Revision.objects.filter(reviewer=user).update(reviewer=sumo_bot)
+            Revision.objects.filter(readied_for_localization_by=user).update(
+                readied_for_localization_by=sumo_bot
+            )
+            HelpfulVote.objects.filter(creator=user).update(creator=sumo_bot)

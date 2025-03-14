@@ -4,7 +4,7 @@ from django.contrib.auth.models import User
 from kitsune.sumo.tests import TestCase
 from kitsune.users.tests import GroupFactory, UserFactory
 from kitsune.wiki.handlers import DocumentListener
-from kitsune.wiki.tests import DocumentFactory
+from kitsune.wiki.tests import ApprovedRevisionFactory, DocumentFactory, HelpfulVoteFactory
 
 
 class TestDocumentListener(TestCase):
@@ -69,3 +69,50 @@ class TestDocumentListener(TestCase):
 
         self.assertTrue(doc3.contributors.filter(id=other_contributor.id).exists())
         self.assertEqual(doc3.contributors.count(), 1)
+
+    def test_revision_user_fields_replacement(self):
+        reviewer = UserFactory()
+        contributor = UserFactory()
+        rev1 = ApprovedRevisionFactory(
+            creator=contributor,
+            reviewer=reviewer,
+            readied_for_localization_by=reviewer,
+        )
+        rev2 = ApprovedRevisionFactory(
+            creator=self.user,
+            reviewer=reviewer,
+            readied_for_localization_by=reviewer,
+        )
+        rev3 = ApprovedRevisionFactory(
+            creator=contributor,
+            reviewer=self.user,
+            readied_for_localization_by=self.user,
+        )
+
+        self.listener.on_user_deletion(self.user)
+
+        for rev in (rev1, rev2, rev3):
+            rev.refresh_from_db()
+
+        self.assertEqual(rev1.creator.username, contributor.username)
+        self.assertEqual(rev1.reviewer.username, reviewer.username)
+        self.assertEqual(rev1.readied_for_localization_by.username, reviewer.username)
+        self.assertEqual(rev2.creator.username, settings.SUMO_BOT_USERNAME)
+        self.assertEqual(rev2.reviewer.username, reviewer.username)
+        self.assertEqual(rev2.readied_for_localization_by.username, reviewer.username)
+        self.assertEqual(rev3.creator.username, contributor.username)
+        self.assertEqual(rev3.reviewer.username, settings.SUMO_BOT_USERNAME)
+        self.assertEqual(rev3.readied_for_localization_by.username, settings.SUMO_BOT_USERNAME)
+
+    def test_helpfulvote_creator_replacement(self):
+        voter = UserFactory()
+        v1 = HelpfulVoteFactory(creator=voter)
+        v2 = HelpfulVoteFactory(creator=self.user)
+
+        self.listener.on_user_deletion(self.user)
+
+        v1.refresh_from_db()
+        v2.refresh_from_db()
+
+        self.assertEqual(v1.creator.username, voter.username)
+        self.assertEqual(v2.creator.username, settings.SUMO_BOT_USERNAME)
