@@ -92,6 +92,7 @@ requests = "^2.32.3"
 fuzzywuzzy = "^0.18.0"
 django-ses = "4.4.0"
 django-post-office = "3.9.1"
+google-adk = "0.5.0"
 
 [tool.poetry.group.dev.dependencies]
 ipdb = "^0.13.11"
