@@ -1,3 +1,4 @@
+from typing import Any, Callable
 import json
 
 from django.db.models import Prefetch, Q
@@ -9,6 +10,7 @@ from kitsune.products.models import Product, Topic
 def get_taxonomy(
     product: Product | str | None = None,
     include_metadata: list[str] | tuple[str, ...] | None = None,
+    callback: Callable[[Topic, dict[str, Any]], dict[str, Any]] | None = None,
     output_format: str = "YAML",
 ) -> str:
     """
@@ -68,6 +70,9 @@ def get_taxonomy(
             if not product:
                 item["products"] = [{"title": p.title} for p in topic.products.all()]
             item["subtopics"] = get_topics(parent=topic)
+
+            if callable(callback):
+                item = callback(topic, item)
 
             result.append(item)
 

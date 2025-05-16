@@ -17,7 +17,7 @@ class GetTaxonomyTests(TestCase):
             description="Something brief about t1...",
             metadata={
                 "description": "Details about t1...",
-                "example-questions-assigned-to-this-topic": [
+                "examples": [
                     "Can you tell me about topic1?",
                     "Is there a setting for topic1?",
                 ],
@@ -29,7 +29,7 @@ class GetTaxonomyTests(TestCase):
             description="Something brief about t2...",
             metadata={
                 "description": "Details about t2...",
-                "example-questions-assigned-to-this-topic": [
+                "examples": [
                     "Can you tell me about topic2?",
                     "Is there a setting for topic2?",
                 ],
@@ -47,7 +47,7 @@ class GetTaxonomyTests(TestCase):
             description="Something brief about t4...",
             metadata={
                 "description": "Details about t4...",
-                "example-questions-assigned-to-this-topic": [
+                "examples": [
                     "Can you tell me about topic4?",
                     "Is there a setting for topic4?",
                 ],
@@ -67,7 +67,7 @@ class GetTaxonomyTests(TestCase):
             description="Something brief about t6...",
             metadata={
                 "description": "Details about t6...",
-                "example-questions-assigned-to-this-topic": [
+                "examples": [
                     "Can you tell me about topic6?",
                     "Is there a setting for topic6?",
                 ],
@@ -94,7 +94,7 @@ class GetTaxonomyTests(TestCase):
             description="Something brief about t9...",
             metadata={
                 "description": "Details about t9...",
-                "example-questions-assigned-to-this-topic": [
+                "examples": [
                     "Can you tell me about topic9?",
                     "Is there a setting for topic9?",
                 ],
@@ -294,13 +294,11 @@ class GetTaxonomyTests(TestCase):
 
     def test_all_products_with_metadata(self):
         self.assertEqual(
-            get_taxonomy(
-                include_metadata=["description", "example-questions-assigned-to-this-topic"]
-            ),
+            get_taxonomy(include_metadata=["description", "examples"]),
             """topics:
 - title: topic1
   description: Details about t1...
-  example-questions-assigned-to-this-topic:
+  examples:
   - Can you tell me about topic1?
   - Is there a setting for topic1?
   products:
@@ -310,7 +308,7 @@ class GetTaxonomyTests(TestCase):
   subtopics: []
 - title: topic2
   description: Details about t2...
-  example-questions-assigned-to-this-topic:
+  examples:
   - Can you tell me about topic2?
   - Is there a setting for topic2?
   products:
@@ -319,7 +317,7 @@ class GetTaxonomyTests(TestCase):
   subtopics:
   - title: topic4
     description: Details about t4...
-    example-questions-assigned-to-this-topic:
+    examples:
     - Can you tell me about topic4?
     - Is there a setting for topic4?
     products:
@@ -334,7 +332,7 @@ class GetTaxonomyTests(TestCase):
   subtopics:
   - title: topic6
     description: Details about t6...
-    example-questions-assigned-to-this-topic:
+    examples:
     - Can you tell me about topic6?
     - Is there a setting for topic6?
     products:
@@ -342,7 +340,7 @@ class GetTaxonomyTests(TestCase):
     subtopics:
     - title: topic9
       description: Details about t9...
-      example-questions-assigned-to-this-topic:
+      examples:
       - Can you tell me about topic9?
       - Is there a setting for topic9?
       products:
@@ -355,19 +353,19 @@ class GetTaxonomyTests(TestCase):
         expected = """topics:
 - title: topic1
   description: Details about t1...
-  example-questions-assigned-to-this-topic:
+  examples:
   - Can you tell me about topic1?
   - Is there a setting for topic1?
   subtopics: []
 - title: topic2
   description: Details about t2...
-  example-questions-assigned-to-this-topic:
+  examples:
   - Can you tell me about topic2?
   - Is there a setting for topic2?
   subtopics:
   - title: topic4
     description: Details about t4...
-    example-questions-assigned-to-this-topic:
+    examples:
     - Can you tell me about topic4?
     - Is there a setting for topic4?
     subtopics: []
@@ -376,13 +374,13 @@ class GetTaxonomyTests(TestCase):
   subtopics:
   - title: topic6
     description: Details about t6...
-    example-questions-assigned-to-this-topic:
+    examples:
     - Can you tell me about topic6?
     - Is there a setting for topic6?
     subtopics:
     - title: topic9
       description: Details about t9...
-      example-questions-assigned-to-this-topic:
+      examples:
       - Can you tell me about topic9?
       - Is there a setting for topic9?
       subtopics: []
@@ -390,21 +388,72 @@ class GetTaxonomyTests(TestCase):
         self.assertEqual(
             get_taxonomy(
                 self.p3,
-                include_metadata=["description", "example-questions-assigned-to-this-topic"],
+                include_metadata=["description", "examples"],
             ),
             expected,
         )
         self.assertEqual(
             get_taxonomy(
                 "mozilla-account",
-                include_metadata=["description", "example-questions-assigned-to-this-topic"],
+                include_metadata=["description", "examples"],
             ),
             expected,
         )
         self.assertEqual(
             get_taxonomy(
                 "product3",
-                include_metadata=["description", "example-questions-assigned-to-this-topic"],
+                include_metadata=["description", "examples"],
+            ),
+            expected,
+        )
+
+    def test_callback(self):
+        expected = """topics:
+- title: topic1
+  description: Details about t1...
+  examples:
+  - Can you tell me about topic1?
+  - Is there a setting for topic1?
+  subtopics: []
+- title: topic2
+  description: Details about t2...
+  examples:
+  - Can you tell me about topic2?
+  - Is there a setting for topic2?
+  subtopics:
+  - title: topic4
+    description: Details about t4...
+    examples:
+    - Can you tell me about topic4?
+    - Is there a setting for topic4?
+    subtopics: []
+- title: topic3
+  description: Details about t3...
+  subtopics:
+  - title: topic6
+    description: Details about t6...
+    examples:
+    - Can you tell me about topic6?
+    - Is there a setting for topic6?
+    subtopics:
+    - title: custom-topic9-title
+      description: Details about t9...
+      examples:
+      - Can you tell me about topic9?
+      - Is there a setting for topic9?
+      subtopics: []
+"""
+
+        def callback(topic, item):
+            if topic.title == "topic9":
+                item.update(title="custom-topic9-title")
+            return item
+
+        self.assertEqual(
+            get_taxonomy(
+                self.p3,
+                include_metadata=["description", "examples"],
+                callback=callback,
             ),
             expected,
         )
