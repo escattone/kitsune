@@ -69,4 +69,5 @@ def classify_question(question: "Question") -> dict[str, Any]:
         decision_lambda
     )
     result: dict[str, Any] = pipeline.invoke(payload)
+    print(result)
     return result
