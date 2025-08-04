@@ -1,19 +1,27 @@
 import hashlib
-from datetime import UTC, date, datetime, timedelta
+from datetime import date, datetime, timedelta
 
 from django.conf import settings
 from django.contrib.auth.models import Group
 from django.contrib.contenttypes.models import ContentType
 from django.core.cache import cache
-from django.db.models import Count, Exists, IntegerField, Max, OuterRef, Q, Subquery
-from django.db.models.functions import Coalesce, Now
-from elasticsearch.dsl import A
+from django.db.models import (
+    Count,
+    DateTimeField,
+    Exists,
+    F,
+    IntegerField,
+    Max,
+    OuterRef,
+    Q,
+    Subquery,
+)
+from django.db.models.functions import Coalesce, Greatest, Now
 
 from kitsune.community.models import DeletedContribution
 from kitsune.products.models import Product
 from kitsune.questions.models import Answer
-from kitsune.search.documents import AnswerDocument, ProfileDocument
-from kitsune.users.models import ContributionAreas, User
+from kitsune.users.models import ContributionAreas, Profile, User
 from kitsune.users.templatetags.jinja_helpers import profile_avatar
 from kitsune.wiki.models import Revision
 
@@ -26,142 +34,126 @@ def top_contributors_questions(start=None, end=None, locale=None, product=None, 
     if not start:
         start = datetime.now() - timedelta(days=DEFAULT_PERIOD_DAYS)
 
-    limit = min(count * 10, 1000)
+    answers_filters = {}
+    deleted_answers_filters = {}
 
-    search = AnswerDocument.search()
-
-    search = (
-        search.filter(
-            # filter out answers by the question author
-            "script",
-            script="doc['creator_id'].value != doc['question_creator_id'].value",
-        )
-        .filter(
-            # filter answers created between `start` and `end`, or within the last 90 days
-            "range",
-            created={"gte": start, "lte": end},
-        )
-        # set the query size to 0 because we don't care about the results
-        # we're just filtering for the aggregations defined below
-        .extra(size=0)
-    )
     if locale:
-        search = search.filter("term", locale=locale)
+        answers_filters.update(question__locale=locale)
+        deleted_answers_filters.update(locale=locale)
+
     if product:
-        search = search.filter("term", question_product_id=product.id)
+        answers_filters.update(question__product=product)
+        deleted_answers_filters.update(products__in=[product])
 
-    # The filters above don't restrict the results to contributors, so we need to
-    # collect more buckets than `count`, so we can hopefully find `count` number
-    # of contributors within the results.
-    search.aggs.bucket(
-        # create buckets for the `limit` most active users
-        "contributions",
-        A("terms", field="creator_id", size=limit),
-    ).bucket(
-        # within each of those, create a bucket for the most recent answer, and extract its date
-        "latest",
-        A(
-            "top_hits",
-            sort={"created": {"order": "desc"}},
-            _source={"includes": "created"},
-            size=1,
-        ),
+    contributor_group_names = ContributionAreas.get_groups()
+
+    qs_answers = Answer.objects.filter(
+        is_spam=False,
+        created__range=(start, end or Now()),
+        **answers_filters,
     )
 
-    contribution_buckets = search.execute().aggregations.contributions.buckets
-
-    deletion_metrics_by_contributor = deleted_contribution_metrics_by_contributor(
-        Answer,
-        start=start,
-        end=end,
-        locale=locale,
-        products=[product] if product else None,
-        max_results=limit,
-        limit_to_contributor_groups=True,
+    qs_deleted_answers = DeletedContribution.objects.filter(
+        contribution_timestamp__range=(start, end or Now()),
+        content_type=ContentType.objects.get_for_model(Answer),
+        **deleted_answers_filters,
     )
 
-    if not (contribution_buckets or deletion_metrics_by_contributor):
-        return [], 0
-
-    user_ids = list(
-        {bucket.key for bucket in contribution_buckets}
-        | {str(contributor_id) for contributor_id in deletion_metrics_by_contributor.keys()}
+    qs_contributors_of_answers = (
+        qs_answers.filter(
+            creator__is_active=True,
+            creator__groups__name__in=contributor_group_names,
+        )
+        .exclude(creator=F("question__creator"))
+        .exclude(creator__profile__account_type=Profile.AccountType.SYSTEM)
+        .values_list("creator", flat=True)
+        .distinct()
     )
-    contributor_group_ids = list(
-        Group.objects.filter(name__in=ContributionAreas.get_groups()).values_list("id", flat=True)
+
+    qs_contributors_of_deleted_answers = (
+        qs_deleted_answers.filter(
+            contributor__is_active=True,
+            contributor__groups__name__in=contributor_group_names,
+        )
+        .values_list("contributor", flat=True)
+        .distinct()
     )
 
-    # fetch all the users returned by the aggregation which are in the contributor groups
-    user_hits = (
-        ProfileDocument.search()
-        .query("terms", **{"_id": user_ids})
-        .query("terms", group_ids=contributor_group_ids)
-        .extra(size=len(user_ids))
-        .execute()
-        .hits
+    qs_top_contributors = (
+        User.objects.filter(
+            Q(id__in=qs_contributors_of_answers) | Q(id__in=qs_contributors_of_deleted_answers)
+        )
+        .annotate(
+            answer_count=Subquery(
+                (
+                    qs_answers.filter(creator=OuterRef("pk"))
+                    .order_by()
+                    .values("creator")
+                    .annotate(total=Count("*"))
+                    .values("total")[:1]
+                ),
+                output_field=IntegerField(),
+            ),
+            last_answer_activity=Subquery(
+                (
+                    qs_answers.filter(creator=OuterRef("pk"))
+                    .order_by()
+                    .values("creator")
+                    .annotate(last_activity=Max("created"))
+                    .values("last_activity")[:1]
+                ),
+                output_field=DateTimeField(),
+            ),
+            deleted_answer_count=Subquery(
+                (
+                    qs_deleted_answers.filter(contributor=OuterRef("pk"))
+                    .order_by()
+                    .values("contributor")
+                    .annotate(total=Count("*"))
+                    .values("total")[:1]
+                ),
+                output_field=IntegerField(),
+            ),
+            last_deleted_answer_activity=Subquery(
+                (
+                    qs_deleted_answers.filter(contributor=OuterRef("pk"))
+                    .order_by()
+                    .values("contributor")
+                    .annotate(last_activity=Max("contribution_timestamp"))
+                    .values("last_activity")[:1]
+                ),
+                output_field=DateTimeField(),
+            ),
+        )
+        .annotate(
+            count=(Coalesce("answer_count", 0) + Coalesce("deleted_answer_count", 0)),
+            last_activity=Greatest(
+                Coalesce(F("last_answer_activity"), F("last_deleted_answer_activity")),
+                Coalesce(F("last_deleted_answer_activity"), F("last_answer_activity")),
+            ),
+        )
+        .select_related("profile")
+        .order_by("-count", "id")
     )
-    users = {hit.meta.id: hit for hit in user_hits}
-
-    total_contributors = len(user_hits)
-
-    # Combine the results from ES and the results from the deleted-contributions query.
-    combined_map = {}
-    for bucket in contribution_buckets:
-        if user := users.get(bucket.key):
-            last_activity = datetime.fromisoformat(bucket.latest.hits.hits[0]._source.created)
-            days_since_last_activity = (datetime.now(tz=UTC) - last_activity).days
-            combined_map[bucket.key] = {
-                "user": user,
-                "count": bucket.doc_count,
-                "days_since_last_activity": days_since_last_activity,
-            }
-
-    for contributor_id, (
-        num_contributions,
-        last_contribution_timestamp,
-    ) in deletion_metrics_by_contributor.items():
-        user_id = str(contributor_id)
-        if user := users.get(user_id):
-            days_since_last_activity = (datetime.now() - last_contribution_timestamp).days
-            if user_info := combined_map.get(user_id):
-                user_info["count"] += num_contributions
-                user_info["days_since_last_activity"] = min(
-                    user_info["days_since_last_activity"], days_since_last_activity
-                )
-            else:
-                combined_map[user_id] = {
-                    "user": user,
-                    "count": num_contributions,
-                    "days_since_last_activity": days_since_last_activity,
-                }
 
     top_contributors = []
-    # Sort by count descending, and secondarily by user id to ensure predictable ordering
-    # when paging.
-    for user_info in sorted(
-        combined_map.values(),
-        key=lambda user_info: (-user_info["count"], int(user_info["user"].meta.id)),
-    )[count * (page - 1) :]:
-        if len(top_contributors) == count:
-            # Stop once we've collected enough contributors.
-            break
-
-        user = user_info["user"]
+    offset = count * (page - 1)
+    for user in qs_top_contributors[offset : offset + count]:
         top_contributors.append(
             {
-                "count": user_info["count"],
-                "term": user.meta.id,
+                "count": user.count,
+                "term": user.id,
                 "user": {
-                    "id": user.meta.id,
+                    "id": user.id,
                     "username": user.username,
-                    "display_name": user.name,
-                    "avatar": getattr(getattr(user, "avatar", None), "url", None),
-                    "days_since_last_activity": user_info["days_since_last_activity"],
+                    "display_name": user.profile.name,
+                    "avatar": user.profile.fxa_avatar,
+                    "days_since_last_activity": (datetime.now() - user.last_activity).days,
                 },
             }
         )
 
-    return top_contributors, total_contributors
+    return top_contributors, qs_top_contributors.count()
 
 
 def top_contributors_kb(**kwargs):
