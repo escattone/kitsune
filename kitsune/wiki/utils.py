@@ -1,13 +1,14 @@
 import random
 import time
+from datetime import timedelta
 from itertools import chain, islice
 
 import requests
 from django.conf import settings
 from django.contrib.auth.models import User
 from django.contrib.sessions.backends.base import SessionBase
-from django.db.models import OuterRef, Q, Subquery
-from django.db.models.functions import Now
+from django.db.models import Count, Exists, F, IntegerField, OuterRef, Q, Subquery, Value, Window
+from django.db.models.functions import Coalesce, Now, RowNumber
 from django.http import Http404, HttpRequest
 from django.shortcuts import get_object_or_404
 
@@ -17,7 +18,7 @@ from kitsune.products.models import Product, Topic
 from kitsune.sumo.urlresolvers import reverse
 from kitsune.wiki.config import REDIRECT_HTML
 from kitsune.wiki.facets import documents_for
-from kitsune.wiki.models import Document, Revision
+from kitsune.wiki.models import Document, HelpfulVote, Revision
 
 KB_VISITED_DEFAULT_TTL = 60 * 60 * 24  # 24 hours
 
@@ -227,6 +228,84 @@ def build_topics_data(request: HttpRequest, product: Product, topics: list[Topic
             - image_url: Topic image URL
             - documents: Up to 3 documents to display
     """
+    locale = request.LANGUAGE_CODE
+
+    top_docs = (
+        Document.objects.visible(
+            request.user,
+            locale=locale,
+            is_template=False,
+            is_archived=False,
+            current_revision__isnull=False,
+            category__in=settings.IA_DEFAULT_CATEGORIES,
+        )
+        .annotate(root_id=Coalesce(F("parent_id"), F("id")))
+        .filter(
+            Exists(
+                Document.objects.filter(
+                    id=OuterRef("root_id"),
+                    products=product,
+                )
+            )
+        )
+        # The topics filter cannot be a subquery -- it has to be via a JOIN -- to
+        # ensure that when a document is associated with multiple topics, each
+        # topic match generates a separate row for that document, where each row
+        # will have a different "topic_id" annotation.
+        .filter(
+            (Q(parent__isnull=True) & Q(topics__in=topics))
+            | (Q(parent__isnull=False) & Q(parent__topics__in=topics))
+        )
+        .annotate(
+            topic_id=Coalesce(F("parent__topics__id"), F("topics__id")),
+            order_for_display=Coalesce(F("parent__display_order"), F("display_order")),
+            # TODO: Count the votes on the parent's revision or the child's revision or both?
+            num_helpful_votes=Coalesce(
+                # This is done as a subquery so it doesn't affect the rows
+                # for the Window function.
+                Subquery(
+                    (
+                        HelpfulVote.objects.filter(
+                            revision=OuterRef("current_revision"),
+                            helpful=True,
+                            created__range=(Now() - timedelta(days=30), Now()),
+                        )
+                        .values("revision")
+                        .annotate(count=Count("pk"))
+                        .values("count")[:1]
+                    ),
+                    output_field=IntegerField(),
+                ),
+                Value(0),
+            ),
+        )
+        .annotate(
+            rank_by_topic=Window(
+                expression=RowNumber(),
+                partition_by=F("topic_id"),
+                order_by=(F("num_helpful_votes").desc(), F("id").asc()),
+            ),
+            total_articles_by_topic=Window(
+                expression=Count("pk"),
+                partition_by=F("topic_id"),
+            ),
+        )
+        .filter(rank_by_topic__lte=3)
+        .order_by("topic_id", "rank_by_topic")
+    )
+
+    # featured_articles = get_featured_articles(
+    #     user=request.user, product=product, topics=topics, locale=request.LANGUAGE_CODE
+    # )
+
+    results_by_topic: dict[int, list] = {topic.id: [] for topic in topics}
+
+    for doc in top_docs:
+        # TODO: Get featured article(s) that match this topic
+        # Get articles for this topic and locale
+        results_by_topic[doc.topic_id].append(doc)
+
+    # !!OLD CODE BELOW!!
     topics_data: list[dict] = []
 
     featured_articles = get_featured_articles(product, locale=request.LANGUAGE_CODE, topics=topics)

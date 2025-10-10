@@ -4,11 +4,11 @@ from datetime import timedelta
 from django.conf import settings
 from django.contrib.postgres.aggregates import StringAgg
 from django.core.cache import cache
-from django.db.models import Case, Count, OuterRef, Q, Subquery, When
-from django.db.models.functions import Now
+from django.db.models import Count, Exists, F, OuterRef, Q, Subquery
+from django.db.models.functions import Coalesce, Now
 
 from kitsune.products.models import Topic
-from kitsune.wiki.models import Document, HelpfulVote
+from kitsune.wiki.models import Document
 
 
 def topics_for(user, product, parent=False):
@@ -102,75 +102,53 @@ def _documents_for(user, locale, topics=None, products=None):
     qs = Document.objects.visible(
         user,
         locale=locale,
+        is_template=False,
         is_archived=False,
         current_revision__isnull=False,
         category__in=settings.IA_DEFAULT_CATEGORIES,
-    )
-    # speed up query by removing any ordering, since we're doing it in python:
-    qs = qs.select_related("current_revision", "parent").order_by()
+    ).annotate(root_id=Coalesce(F("parent_id"), F("id")))
 
     if topics:
-        topic_ids = [t.id for t in topics]
-        # For parent documents: include if they have the requested topics
-        # For translations: include ONLY if their parent has the requested topics,
-        # completely ignoring any topics directly assigned to the translation
         qs = qs.filter(
-            # Either this is a parent document with matching topics
-            (Q(parent__isnull=True) & Q(topics__in=topic_ids))
-            # OR this is a translation and its parent has matching topics
-            | (Q(parent__isnull=False) & Q(parent__topics__in=topic_ids))
-        )
-
-    for product in products or []:
-        # we need to filter against parent products for localized articles
-        qs = qs.filter(Q(products=product) | Q(parent__products=product))
-
-    qs = qs.distinct()
-
-    votes_cache_key = f"votes_for:{cache_key}"
-    votes_dict = cache.get(votes_cache_key)
-    if votes_dict is None:
-        # NOTE: It's important to use "created__range" rather than "created__gt"
-        #       with Postgres, otherwise it won't use the index on the "created"
-        #       field, and the "HelpfulVote" query will be massively slower.
-        votes_query = (
-            HelpfulVote.objects.filter(
-                revision_id__in=qs.values_list("current_revision_id", flat=True),
-                created__range=(Now() - timedelta(days=30), Now()),
-                helpful=True,
+            Exists(
+                Document.objects.filter(
+                    id=OuterRef("root_id"),
+                    topics__in=topics,
+                )
             )
-            .values("revision_id")
-            .annotate(count=Count("*"))
-            .values("revision_id", "count")
         )
-        votes_dict = {row["revision_id"]: row["count"] for row in votes_query}
-        # the votes query is rather expensive, and only used for ordering,
-        # so we can cache it rather aggressively
-        cache.set(votes_cache_key, votes_dict, timeout=settings.CACHE_LONG_TIMEOUT)
 
-    # Annotate each of the documents with its string of product titles. This must
-    # be a sub-query in order to free itself from the product filter(s) above.
+    if products:
+        qs = qs.filter(
+            Exists(
+                Document.objects.filter(
+                    id=OuterRef("root_id"),
+                    products__in=products,
+                )
+            )
+        )
+
     qs = qs.annotate(
+        num_helpful_votes=Count(
+            "current_revision__poll_votes",
+            filter=Q(
+                current_revision__poll_votes__helpful=True,
+                current_revision__poll_votes__created__range=(Now() - timedelta(days=30), Now()),
+            ),
+        ),
         product_titles=Subquery(
-            Document.objects.filter(pk=OuterRef("pk"))
+            Document.objects.filter(id=OuterRef("root_id"))
             .annotate(
-                product_titles=Case(
-                    When(
-                        parent__isnull=False,
-                        then=StringAgg(
-                            "parent__products__title",
-                            delimiter=", ",
-                            ordering="parent__products__title",
-                        ),
-                    ),
-                    default=StringAgg(
-                        "products__title", delimiter=", ", ordering="products__title"
-                    ),
+                product_titles=StringAgg(
+                    "products__title", delimiter=", ", ordering="products__title"
                 ),
             )
-            .values("product_titles")
-        )
+            .values("product_titles")[:1]
+        ),
+        order=Coalesce("parent__display_order", "display_order"),
     )
+
+    qs = qs.select_related("current_revision", "parent").order_by("order", "-num_helpful_votes")
 
     doc_dicts = []
     for d in qs:
@@ -184,12 +162,9 @@ def _documents_for(user, locale, topics=None, products=None):
                 "product_titles": d.product_titles,
                 "document_summary": d.current_revision.summary,
                 "display_order": d.original.display_order,
-                "helpful_votes": votes_dict.get(d.current_revision_id, 0),
+                "helpful_votes": d.num_helpful_votes,
             }
         )
-
-    # sort the results by ascending display_order and descending votes
-    doc_dicts.sort(key=lambda x: (x["display_order"], -x["helpful_votes"]))
 
     if not user.is_authenticated:
         cache.set(documents_cache_key, doc_dicts)
