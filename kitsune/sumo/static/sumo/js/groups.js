@@ -15,6 +15,7 @@ import "sumo/js/libs/jquery.lazyload";
     Marky.createCustomToolbar('.editor-tools', '#id_information', buttons);
 
     initGroupsTree();
+    initAddUsersForm();
 
     // Initialize lazy loading for images in group information
     $("img.lazy").lazyload();
@@ -56,6 +57,29 @@ import "sumo/js/libs/jquery.lazyload";
         }
       });
     }
+  }
+
+  function initAddUsersForm() {
+    const form = document.getElementById('add-users-form');
+    if (!form) return;
+
+    // Handle successful form submission via HTMX
+    form.addEventListener('htmx:afterRequest', function(event) {
+      if (event.detail.successful) {
+        // Clear the tokenInput autocomplete widget (requires jQuery since tokenInput is a jQuery plugin)
+        const input = form.querySelector('input.user-autocomplete');
+        if (input) {
+          $(input).tokenInput('clear');
+        }
+        // Reset the form
+        form.reset();
+        // Close the form by unchecking the toggle
+        const toggle = document.getElementById('toggle-add-users');
+        if (toggle) {
+          toggle.checked = false;
+        }
+      }
+    });
   }
 
   function initGroupsTree() {

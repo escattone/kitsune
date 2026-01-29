@@ -3,8 +3,9 @@ from django.contrib import messages
 from django.contrib.auth.models import Group, User
 from django.core.exceptions import PermissionDenied
 from django.core.files.storage import default_storage
-from django.http import HttpResponseRedirect
+from django.http import HttpResponse, HttpResponseRedirect
 from django.shortcuts import get_object_or_404, render
+from django.template.loader import render_to_string
 from django.utils.translation import gettext as _
 from django.views.decorators.http import require_http_methods, require_POST
 
@@ -48,6 +49,7 @@ def profile(request, group_slug, member_form=None, leader_form=None):
             "profile": prof,
             "leaders": leaders,
             "members": members,
+            "member_count": members.paginator.count,
             "user_can_edit": user_can_edit,
             "user_can_moderate": user_can_moderate,
             "member_form": member_form or AddUserForm(),
@@ -147,6 +149,29 @@ def add_member(request, group_slug):
             user.groups.add(prof.group)
         msg = _("{users} added to the group successfully!").format(users=request.POST.get("users"))
         messages.add_message(request, messages.SUCCESS, msg)
+
+        # Handle HTMX request
+        if request.headers.get("hx-request"):
+            members_qs = prof.group.user_set.all().select_related("profile")
+            members = paginate(request, members_qs, per_page=30)
+            member_count = members.paginator.count
+            user_can_moderate = prof.can_moderate_group(request.user)
+
+            context = {
+                "profile": prof,
+                "members": members,
+                "member_count": member_count,
+                "user_can_edit": True,
+                "user_can_moderate": user_can_moderate,
+            }
+
+            # Return multiple partial updates with hx-swap-oob
+            html = render_to_string("groups/partials/members.html", context, request)
+            html += render_to_string("groups/partials/member_count.html", context, request)
+            html += render_to_string("groups/partials/header_member_count.html", context, request)
+
+            return HttpResponse(html)
+
         return HttpResponseRedirect(prof.get_absolute_url())
 
     msg = _("There were errors adding members to the group, see below.")
@@ -196,6 +221,32 @@ def add_leader(request, group_slug):
             users=request.POST.get("users")
         )
         messages.add_message(request, messages.SUCCESS, msg)
+
+        # Handle HTMX request
+        if request.headers.get("hx-request"):
+            leaders = prof.leaders.all().select_related("profile")
+            members_qs = prof.group.user_set.all().select_related("profile")
+            members = paginate(request, members_qs, per_page=30)
+            member_count = members.paginator.count
+
+            context = {
+                "profile": prof,
+                "leaders": leaders,
+                "members": members,
+                "member_count": member_count,
+                "user_can_edit": True,
+                "user_can_moderate": True,
+            }
+
+            # Return multiple partial updates with hx-swap-oob
+            html = render_to_string("groups/partials/leaders.html", context, request)
+            html += render_to_string("groups/partials/members.html", context, request)
+            html += render_to_string("groups/partials/leader_count.html", context, request)
+            html += render_to_string("groups/partials/member_count.html", context, request)
+            html += render_to_string("groups/partials/header_member_count.html", context, request)
+
+            return HttpResponse(html)
+
         return HttpResponseRedirect(prof.get_absolute_url())
 
     msg = _("There were errors adding leaders to the group, see below.")

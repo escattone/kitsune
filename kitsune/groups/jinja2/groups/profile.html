@@ -31,14 +31,8 @@
 
     {# Quick stats #}
     <div class="group-stats">
-      <div class="stat-item">
-        <span class="stat-value">{{ leaders|length }}</span>
-        <span class="stat-label">{{ _('Leaders') }}</span>
-      </div>
-      <div class="stat-item">
-        <span class="stat-value">{{ members.paginator.count }}</span>
-        <span class="stat-label">{{ _('Members') }}</span>
-      </div>
+      {% include "groups/partials/leader_count.html" with context %}
+      {% include "groups/partials/member_count.html" with context %}
       {% if children %}
         <div class="stat-item">
           <span class="stat-value">{{ children|length }}</span>
@@ -87,10 +81,16 @@
             {% csrf_token %}
             {{ member_form.users|safe }}
             <div class="action-buttons">
-              <button type="submit" name="action" value="member" formaction="{{ url('groups.add_member', profile.slug) }}" class="sumo-button secondary-button button-sm">
+              <button type="submit" name="action" value="member"
+                      hx-post="{{ url('groups.add_member', profile.slug) }}"
+                      hx-swap="none"
+                      class="sumo-button secondary-button button-sm">
                 {{ _('Add to Members') }}
               </button>
-              <button type="submit" name="action" value="leader" formaction="{{ url('groups.add_leader', profile.slug) }}" class="sumo-button secondary-button button-sm">
+              <button type="submit" name="action" value="leader"
+                      hx-post="{{ url('groups.add_leader', profile.slug) }}"
+                      hx-swap="none"
+                      class="sumo-button secondary-button button-sm">
                 {{ _('Add to Leaders') }}
               </button>
             </div>
@@ -111,9 +111,7 @@
           <span class="badge badge--visibility">
             {{ profile.get_visibility_display() }}
           </span>
-          <span class="badge badge--count">
-            {{ members.paginator.count }} {{ _('members') }}
-          </span>
+          {% include "groups/partials/header_member_count.html" with context %}
         </div>
       </div>
       {% if user_can_edit %}
@@ -142,73 +140,10 @@
     {% endif %}
 
     {# Group Leaders section #}
-    <div class="group-section" id="group-leaders">
-      <div class="section-heading">
-        <h2>{{ _('Group leaders') }}</h2>
-      </div>
-
-      {% if leaders %}
-      <ul class="users leaders">
-        {% for user in leaders %}
-          <li>
-            {{ user_row(user, is_leader=true) }}
-            {% if user_can_moderate %}
-              <div class="remove">
-                <a href="{{ url('groups.remove_leader', profile.slug, user.id) }}" title="{{ _('Remove user from leaders') }}">&#x2716;</a>
-              </div>
-            {% endif %}
-          </li>
-        {% endfor %}
-      </ul>
-      {% endif %}
-    </div>
+    {% set is_leader = true %}
+    {% include "groups/partials/leaders.html" with context %}
 
     {# Group Members section #}
-    <div class="group-section" id="group-members">
-      <div class="section-heading">
-        <h2>{{ _('Group members') }}</h2>
-      </div>
-
-      {% if members %}
-      <ul class="users members">
-        {% for user in members %}
-          <li>
-            {{ user_row(user, is_leader=false) }}
-            {% if user_can_edit %}
-              <div class="remove">
-                <a href="{{ url('groups.remove_member', profile.slug, user.id) }}" title="{{ _('Remove user from group') }}">&#x2716;</a>
-              </div>
-            {% endif %}
-          </li>
-        {% endfor %}
-      </ul>
-      {% endif %}
-
-      {% if members.object_list %}
-        {{ members|paginator }}
-      {% endif %}
-    </div>
+    {% include "groups/partials/members.html" with context %}
   </article>
 {% endblock %}
-
-{% macro user_row(user, is_leader=false) -%}
-  <div class="user-card-content">
-    <div class="avatar">
-      <a rel="nofollow" href="{{ profile_url(user) }}">
-        <img src="{{ profile_avatar(user) }}" alt="{{ display_name(user) }}" />
-      </a>
-    </div>
-    <div class="info">
-      <a rel="nofollow" href="{{ profile_url(user) }}" class="user-name">{{ display_name(user) }}</a>
-      {% if is_leader %}
-      <span class="leader-badge">
-        <svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="currentColor">
-          <path d="M12 2l3.09 6.26L22 9.27l-5 4.87 1.18 6.88L12 17.77l-6.18 3.25L7 14.14 2 9.27l6.91-1.01L12 2z"/>
-        </svg>
-        {{ _('Leader') }}
-      </span>
-      {% endif %}
-      {{ private_message(user) }}
-    </div>
-  </div>
-{%- endmacro %}
