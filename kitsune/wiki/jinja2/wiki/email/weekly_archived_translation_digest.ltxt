@@ -1,0 +1,33 @@
+{# This is an email. Whitespace matters! #}
+{%- autoescape false %}
+{{ _('Hi {username}')|f(username=display_name(recipient)) }}
+
+{% trans %}
+The following archived knowledge base articles were automatically translated this week:
+{% endtrans %}
+
+{% for locale, revisions in revisions_by_locale.items() %}
+{{ locale }}:
+
+{% for revision in revisions %}
+• {{ revision.document.parent.title }} → {{ revision.document.title }}
+  (https://{{ host }}{{ revision.document.get_absolute_url() }})
+
+{% endfor %}
+{% endfor %}
+
+{% trans %}
+These translations were generated automatically for archived content. You received
+this digest because you are watching translations for these articles or locales.
+{% endtrans %}
+
+{% trans %}
+To change your notification preferences, visit:
+{% endtrans %}
+https://{{ host }}{{ url('users.edit_settings') }}
+
+{% trans %}
+Regards,
+The SUMO team
+{% endtrans %}
+{% endautoescape %}

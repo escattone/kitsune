@@ -45,14 +45,11 @@ class TranslationQueryBuilder:
         Returns:
             QuerySet of English documents that can be translated
         """
-        return (
-            Document.objects.filter(
-                locale=settings.WIKI_DEFAULT_LANGUAGE,
-                is_localizable=True,
-                latest_localizable_revision__isnull=False,
-            )
-            .exclude(html__startswith=REDIRECT_HTML)
-        )
+        return Document.objects.filter(
+            locale=settings.WIKI_DEFAULT_LANGUAGE,
+            is_localizable=True,
+            latest_localizable_revision__isnull=False,
+        ).exclude(html__startswith=REDIRECT_HTML)
 
     def _base_stale_translations(
         self, target_locales: list[str], cutoff_date
@@ -86,7 +83,9 @@ class TranslationQueryBuilder:
             .filter(has_pending_llm_revision=False)
         )
 
-    def get_stale_docs_hybrid(self, limit: int | None = None) -> list[tuple[Document, Document, str]]:
+    def get_stale_docs_hybrid(
+        self, limit: int | None = None
+    ) -> list[tuple[Document, Document, str]]:
         """Find non-archived stale translations in HYBRID locales.
 
         Distributes evenly across locales to avoid overloading reviewers.
@@ -110,10 +109,9 @@ class TranslationQueryBuilder:
             remaining = limit - len(result)
             fetch_count = min(settings.HYBRID_QUOTA_PER_LOCALE, remaining)
 
-            queryset = (
-                self._base_stale_translations([locale], cutoff_date)
-                .filter(parent__is_archived=False)[:fetch_count]
-            )
+            queryset = self._base_stale_translations([locale], cutoff_date).filter(
+                parent__is_archived=False
+            )[:fetch_count]
 
             result.extend(
                 (translation_doc.parent, translation_doc, translation_doc.locale)
@@ -138,13 +136,14 @@ class TranslationQueryBuilder:
         cutoff_date = timezone.now() - timedelta(days=settings.STALE_TRANSLATION_THRESHOLD_DAYS)
 
         # AI locales: all documents
-        ai_locales_queryset = self._base_stale_translations(settings.AI_ENABLED_LOCALES, cutoff_date)
+        ai_locales_queryset = self._base_stale_translations(
+            settings.AI_ENABLED_LOCALES, cutoff_date
+        )
 
         # HYBRID locales: only archived documents
-        hybrid_locales_queryset = (
-            self._base_stale_translations(settings.HYBRID_ENABLED_LOCALES, cutoff_date)
-            .filter(parent__is_archived=True)
-        )
+        hybrid_locales_queryset = self._base_stale_translations(
+            settings.HYBRID_ENABLED_LOCALES, cutoff_date
+        ).filter(parent__is_archived=True)
 
         # Combine both querysets
         queryset = ai_locales_queryset.union(hybrid_locales_queryset)
@@ -157,7 +156,9 @@ class TranslationQueryBuilder:
             for translation_doc in queryset
         ]
 
-    def get_missing_docs_hybrid(self, limit: int | None = None) -> list[tuple[Document, None, str]]:
+    def get_missing_docs_hybrid(
+        self, limit: int | None = None
+    ) -> list[tuple[Document, None, str]]:
         """Find non-archived English docs without translations in HYBRID locales.
 
         Distributes evenly across locales to avoid overloading reviewers.
@@ -223,10 +224,8 @@ class TranslationQueryBuilder:
                 # HYBRID locales: only archived documents
                 docs = base_query.filter(is_archived=True)
 
-            docs = (
-                docs
-                .select_related("latest_localizable_revision")
-                .order_by("-latest_localizable_revision__created")
+            docs = docs.select_related("latest_localizable_revision").order_by(
+                "-latest_localizable_revision__created"
             )
 
             remaining_limit = limit - len(missing_translations) if limit else None
@@ -265,7 +264,9 @@ class TranslationQueryBuilder:
             created__lt=Now() - timedelta(hours=settings.HYBRID_REVIEW_GRACE_PERIOD),
         ).exclude(another_already_approved | translations_discontinued)
 
-    def get_obsolete_translations(self, document: Document | None = None) -> models.QuerySet[Revision]:
+    def get_obsolete_translations(
+        self, document: Document | None = None
+    ) -> models.QuerySet[Revision]:
         """Find unreviewed hybrid translations that are no longer useful.
 
         Args:
@@ -308,6 +309,31 @@ class TranslationQueryBuilder:
 
         return queryset
 
+    def get_completed_archived_translations(self, days: int = 7) -> models.QuerySet[Revision]:
+        """Find AI-approved translations of archived documents from the past N days.
+
+        Used for generating weekly digest notifications.
+
+        Args:
+            days: Number of days to look back (default: 7)
+
+        Returns:
+            QuerySet of approved Revision objects for archived document translations
+        """
+        cutoff_date = timezone.now() - timedelta(days=days)
+
+        return (
+            Revision.objects.filter(
+                created__gte=cutoff_date,
+                creator=self.sumo_bot,
+                reviewer=self.sumo_bot,
+                is_approved=True,
+                document__parent__is_archived=True,
+            )
+            .select_related("document", "document__parent")
+            .order_by("document__locale", "created")
+        )
+
 
 class BaseTranslationService:
     """Base service for managing translation processing."""
@@ -330,22 +356,24 @@ class BaseTranslationService:
             The list of processed candidates
         """
         for english_doc, translation_doc, locale in candidates:
-            translation_method = self.strategy_factory.get_method_for_document(
-                english_doc, locale
-            )
+            translation_method = self.strategy_factory.get_method_for_document(english_doc, locale)
 
-            metadata = {"english_revision_date": english_doc.latest_localizable_revision.created.isoformat()}
+            metadata = {
+                "english_revision_date": english_doc.latest_localizable_revision.created.isoformat()
+            }
 
             if translation_doc:
-                metadata.update({
-                    "stale_translation_update": True,
-                    "previous_translation_revision_id": translation_doc.current_revision.id
-                    if translation_doc.current_revision
-                    else None,
-                    "translation_revision_date": translation_doc.current_revision.created.isoformat()
-                    if translation_doc.current_revision
-                    else None,
-                })
+                metadata.update(
+                    {
+                        "stale_translation_update": True,
+                        "previous_translation_revision_id": translation_doc.current_revision.id
+                        if translation_doc.current_revision
+                        else None,
+                        "translation_revision_date": translation_doc.current_revision.created.isoformat()
+                        if translation_doc.current_revision
+                        else None,
+                    }
+                )
 
             l10n_request = TranslationRequest(
                 revision=english_doc.latest_localizable_revision,

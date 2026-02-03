@@ -1,0 +1,62 @@
+{% extends 'email/base.html' %}
+
+{% block styles %}
+ul {
+padding: 0;
+list-style-type: none;
+}
+ul li {
+margin-bottom: 0.5em;
+}
+{% endblock %}
+
+{% block content %}
+<p>
+  {{ _('Hi {username},')|f(username=display_name(recipient)) }}
+</p>
+
+<p>
+  {% trans %}
+  The following archived knowledge base articles were automatically translated this week:
+  {% endtrans %}
+</p>
+
+{% for locale, revisions in revisions_by_locale.items() %}
+<p>
+  <strong>{{ locale }}</strong>
+  <ul>
+    {% for revision in revisions %}
+    <li>
+      {{ revision.document.parent.title }} →
+      <a href="https://{{ host }}{{ revision.document.get_absolute_url() }}">
+        {{ revision.document.title }}
+      </a>
+    </li>
+    {% endfor %}
+  </ul>
+</p>
+{% endfor %}
+
+<p>
+  {% trans %}
+  These translations were generated automatically for archived content. You received
+  this digest because you are watching translations for these articles or locales.
+  {% endtrans %}
+</p>
+
+<p>
+  {% trans %}
+  To change your notification preferences, visit:
+  {% endtrans %}
+  <a href="https://{{ host }}{{ url('users.edit_settings') }}">
+    https://{{ host }}{{ url('users.edit_settings') }}
+  </a>
+</p>
+
+<p>
+  {% trans %}
+  Regards,
+  <br />The SUMO team.
+  {% endtrans %}
+</p>
+{% endblock %}

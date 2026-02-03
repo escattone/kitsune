@@ -187,4 +187,9 @@ PERIODIC_TASKS_PRODUCTION_ONLY = {
         "task": "kitsune.wiki.tasks.send_weekly_ready_for_review_digest",
         "schedule": crontab(hour="4", minute="0", day_of_week="5"),
     },
+    # Every Monday at 09:00.
+    "send_weekly_archived_translation_digest": {
+        "task": "kitsune.wiki.tasks.send_weekly_archived_translation_digest",
+        "schedule": crontab(hour="9", minute="0", day_of_week="1"),
+    },
 }

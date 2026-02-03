@@ -604,3 +604,76 @@ def cleanup_old_anchor_records() -> None:
     )
 
     log.info(f"Deleted {num_deleted} stale anchor record(s).")
+
+
+@shared_task
+@skip_if_read_only_mode
+def send_weekly_archived_translation_digest() -> None:
+    """Send weekly digest of AI translations for archived documents."""
+    from kitsune.wiki.events import ApprovedOrReadyUnion
+    from kitsune.wiki.services import TranslationQueryBuilder
+
+    query_builder = TranslationQueryBuilder()
+    revisions = query_builder.get_completed_archived_translations(days=7)
+
+    if not revisions.exists():
+        log.info("No archived document translations this week.")
+        return
+
+    log.info(f"Sending digest for {revisions.count()} archived document translations.")
+
+    # Group revisions by locale for email organization
+    revisions_by_locale: dict[str, list[Revision]] = {}
+    for rev in revisions:
+        locale = rev.document.locale
+        if locale not in revisions_by_locale:
+            revisions_by_locale[locale] = []
+        revisions_by_locale[locale].append(rev)
+
+    # Collect all users who should receive notifications
+    # Use the existing event system to determine who would have been notified
+    recipients = set()
+    for rev in revisions:
+        event = ApprovedOrReadyUnion(rev)
+        users_and_watches = event._users_watching(exclude=[rev.creator, rev.reviewer])
+
+        for user, watches in users_and_watches:
+            # Only send to users with active profiles who want email notifications
+            if hasattr(user, "profile") and user.is_active and not user.profile.is_system_account:
+                recipients.add(user)
+
+    # Send digest emails
+    messages = []
+
+    @email_utils.safe_translation
+    def _make_digest_mail(locale, user, context):
+        subject = _("Weekly Digest: Archived Article Translations")
+
+        return email_utils.make_mail(
+            subject=subject,
+            text_template="wiki/email/weekly_archived_translation_digest.ltxt",
+            html_template="wiki/email/weekly_archived_translation_digest.html",
+            context_vars=context,
+            from_email=settings.TIDINGS_FROM_ADDRESS,
+            to_email=user.email,
+        )
+
+    for user in recipients:
+        user_locale = (
+            user.profile.locale if hasattr(user, "profile") else settings.WIKI_DEFAULT_LANGUAGE
+        )
+
+        messages.append(
+            _make_digest_mail(
+                user_locale,
+                user,
+                {
+                    "host": Site.objects.get_current().domain,
+                    "revisions_by_locale": revisions_by_locale,
+                    "recipient": user,
+                },
+            )
+        )
+
+    email_utils.send_messages(messages)
+    log.info(f"Sent {len(messages)} digest emails.")
