@@ -7,7 +7,7 @@ from functools import wraps
 
 from django.conf import settings
 from django.contrib import messages
-from django.contrib.auth.models import User
+from django.contrib.auth.models import Group, User
 from django.contrib.postgres.aggregates import ArrayAgg
 from django.core.cache import cache
 from django.core.exceptions import PermissionDenied
@@ -690,12 +690,25 @@ def preview_revision(request):
         doc = None
         products = Product.active.all()
 
+    # Use POSTed group IDs if the field was present in the form (staff only),
+    # otherwise fall back to the saved document's groups.
+    if "restrict_to_groups" in request.POST:
+        posted_group_ids = request.POST.get("restrict_to_groups")
+        if posted_group_ids:
+            restrict_to_groups = Group.objects.filter(pk__in=posted_group_ids.split(","))
+        else:
+            restrict_to_groups = None
+    elif doc:
+        restrict_to_groups = doc.original.restrict_to_groups
+    else:
+        restrict_to_groups = None
+
     data = {
         "content": wiki_to_html(
             wiki_content,
             request.LANGUAGE_CODE,
             doc_id=doc.id if doc else None,
-            restrict_to_groups=doc.original.restrict_to_groups if doc else None,
+            restrict_to_groups=restrict_to_groups,
         ),
         "products": products,
     }

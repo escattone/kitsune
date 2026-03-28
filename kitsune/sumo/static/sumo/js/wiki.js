@@ -236,7 +236,14 @@ import collapsibleAccordionInit from "sumo/js/protocol-details-init";
       $previewBottom = $('#preview-bottom'),
       preview = new AjaxPreview($('.btn-preview'), {
         contentElement: $('#id_content'),
-        previewElement: $preview
+        previewElement: $preview,
+        extraData: function() {
+          var $groups = $('#id_restrict_to_groups');
+          if ($groups.length) {
+            return {restrict_to_groups: ($groups.val() || []).join(',')};
+          }
+          return {};
+        }
       });
     $(preview).on('done', function (e, success) {
       if (success) {

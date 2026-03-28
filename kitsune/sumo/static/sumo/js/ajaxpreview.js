@@ -36,6 +36,7 @@ export default function AjaxPreview(el, options) {
         slug = ($btn.closest('form').find('input[name=slug]').val()) ||
                 window.location.pathname,
         locale = $btn.closest('form').find('[name=locale]').val(),
+        extraData = o.extraData || null,
         changeHash = o.changeHash === undefined ? true : o.changeHash;
 
       $btn.on('click', function(e) {
@@ -49,12 +50,12 @@ export default function AjaxPreview(el, options) {
         $.ajax({
           url: previewUrl,
           type: 'POST',
-          data: {
+          data: $.extend({
             content: $content.val(),
             slug: slug,
             locale: locale,
             csrfmiddlewaretoken: csrftoken
-          },
+          }, extraData ? (typeof extraData === 'function' ? extraData() : extraData) : {}),
           dataType: 'html',
           success: function(html) {
             $(self).trigger('show-preview', [true, html]);

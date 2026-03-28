@@ -445,6 +445,67 @@ class PreviewRevisionVisibilityTests(TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertNotContains(response, "Secret content")
 
+    def test_preview_with_posted_group_ids_allows_restricted_include(self):
+        """Preview with posted group IDs should allow matching restricted includes."""
+        group = GroupFactory()
+        restricted = DocumentFactory(title="Restricted Doc", restrict_to_groups=[group])
+        ApprovedRevisionFactory(document=restricted, content="Secret content")
+
+        user = UserFactory(is_superuser=True)
+        self.client.login(username=user.username, password="testpass")
+        response = self.client.post(
+            reverse("wiki.preview"),
+            data={
+                "content": "[[Include:Restricted Doc]]",
+                "restrict_to_groups": str(group.id),
+            },
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "Secret content")
+
+    def test_preview_with_posted_group_ids_blocks_non_matching_include(self):
+        """Preview with posted group IDs should block includes from other groups."""
+        group_a = GroupFactory()
+        group_b = GroupFactory()
+        restricted = DocumentFactory(title="Restricted Doc", restrict_to_groups=[group_a])
+        ApprovedRevisionFactory(document=restricted, content="Secret content")
+
+        user = UserFactory(is_superuser=True)
+        self.client.login(username=user.username, password="testpass")
+        response = self.client.post(
+            reverse("wiki.preview"),
+            data={
+                "content": "[[Include:Restricted Doc]]",
+                "restrict_to_groups": str(group_b.id),
+            },
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertNotContains(response, "Secret content")
+
+    def test_preview_with_empty_posted_groups_overrides_doc_groups(self):
+        """Preview with empty posted groups should treat the doc as unrestricted."""
+        group = GroupFactory()
+        restricted = DocumentFactory(title="Restricted Doc", restrict_to_groups=[group])
+        ApprovedRevisionFactory(document=restricted, content="Secret content")
+
+        source = DocumentFactory(title="Source Doc", restrict_to_groups=[group])
+        ApprovedRevisionFactory(document=source)
+        user = UserFactory(is_superuser=True)
+        self.client.login(username=user.username, password="testpass")
+        # Empty string means "field present, no groups selected" — should override
+        # the saved doc's groups and treat the preview as unrestricted.
+        response = self.client.post(
+            reverse("wiki.preview"),
+            data={
+                "content": "[[Include:Restricted Doc]]",
+                "slug": source.slug,
+                "locale": source.locale,
+                "restrict_to_groups": "",
+            },
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertNotContains(response, "Secret content")
+
 
 class DocumentRevisionsVisibilityTests(TestCase):
     """Document revisions visibility tests."""

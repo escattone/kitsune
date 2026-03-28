@@ -62,5 +62,29 @@ describe('ajax preview', () => {
       });
       $('#preview').trigger('click');
     });
+
+    it('should merge extraData object into POST data', done => {
+      let ajaxPreview = new AjaxPreview($('#preview'), {
+        extraData: {restrict_to_groups: '1,2'}
+      });
+      $(ajaxPreview).on('done', () => {
+        let callData = $.ajax.getCall(0).args[0].data;
+        expect(callData.restrict_to_groups).to.equal('1,2');
+        done();
+      });
+      $(ajaxPreview).trigger('get-preview');
+    });
+
+    it('should merge extraData function return value into POST data', done => {
+      let ajaxPreview = new AjaxPreview($('#preview'), {
+        extraData: function() { return {restrict_to_groups: '3,4'}; }
+      });
+      $(ajaxPreview).on('done', () => {
+        let callData = $.ajax.getCall(0).args[0].data;
+        expect(callData.restrict_to_groups).to.equal('3,4');
+        done();
+      });
+      $(ajaxPreview).trigger('get-preview');
+    });
   });
 });
