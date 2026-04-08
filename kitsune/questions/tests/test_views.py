@@ -1,8 +1,9 @@
 import json
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from django.conf import settings
 from django.test.utils import override_settings
+from django.utils import timezone
 from pyquery import PyQuery as pq
 
 from kitsune.flagit.models import FlaggedObject
@@ -27,10 +28,12 @@ from kitsune.questions.tests import (
     QuestionLocaleFactory,
 )
 from kitsune.questions.views import parse_troubleshooting
+from kitsune.search.documents import QuestionDocument
 from kitsune.search.tests import ElasticTestCase
 from kitsune.sumo.templatetags.jinja_helpers import urlparams
 from kitsune.sumo.tests import TestCase, eq_msg, get, template_used
 from kitsune.sumo.urlresolvers import reverse
+from kitsune.tags.tests import TagFactory
 from kitsune.tidings.models import Watch
 from kitsune.users.tests import UserFactory, add_permission
 
@@ -334,6 +337,151 @@ class TroubleshootingParsingTests(TestCase):
             }"""
 
         assert parse_troubleshooting(troubleshooting) is not None
+
+
+@override_settings(CELERY_TASK_ALWAYS_EAGER=True)
+class TestQuestionTags(ElasticTestCase):
+    """Tests for the question_tags view (tag sidebar) filter alignment."""
+
+    def setUp(self):
+        self.product = ProductFactory(slug="firefox")
+        locale, _ = QuestionLocale.objects.get_or_create(locale=settings.LANGUAGE_CODE)
+        ProductSupportConfigFactory(
+            product=self.product,
+            is_active=True,
+            forum_config=AAQConfigFactory(enabled_locales=[locale]),
+            default_support_type=ProductSupportConfig.SUPPORT_TYPE_FORUM,
+        )
+        self.tag = TagFactory(name="crash", slug="crash")
+
+    def _get_tags(self, **params):
+        """Helper to call the question_tags endpoint and return {name: count} dict."""
+        url = reverse("questions.tags")
+        response = self.client.get(url, params)
+        self.assertEqual(response.status_code, 200)
+        if not response.content.strip():
+            return {}
+        doc = pq(response.content)
+        tags = {}
+        for el in doc(".sidebar-tags--list li"):
+            name = pq(el).attr("data-name")
+            count = int(pq(el).find(".sidebar-tags--count").text())
+            tags[name] = count
+        return tags
+
+    def _refresh_es(self):
+        QuestionDocument._index.refresh()
+
+    def test_90_day_unanswered_exclusion(self):
+        """Tags on old unanswered questions should not appear in the sidebar."""
+        QuestionFactory(
+            product=self.product,
+            created=timezone.now() - timedelta(days=100),
+            updated=timezone.now() - timedelta(days=1),
+            tags=[self.tag],
+        )
+        self._refresh_es()
+
+        tags = self._get_tags(product_slug="firefox", show="all")
+        self.assertNotIn("crash", tags)
+
+        # But a recent unanswered question's tags should appear.
+        QuestionFactory(
+            product=self.product,
+            tags=[self.tag],
+        )
+        self._refresh_es()
+
+        tags = self._get_tags(product_slug="firefox", show="all")
+        self.assertIn("crash", tags)
+
+    def test_90_day_exclusion_does_not_apply_when_has_answers(self):
+        """Old questions WITH answers should not be excluded."""
+        old_question = QuestionFactory(
+            product=self.product,
+            created=timezone.now() - timedelta(days=100),
+            updated=timezone.now() - timedelta(days=1),
+            tags=[self.tag],
+        )
+        AnswerFactory(question=old_question)
+        self._refresh_es()
+
+        tags = self._get_tags(product_slug="firefox", show="all")
+        self.assertIn("crash", tags)
+
+    def test_subfilter_new(self):
+        """The 'new' sub-filter should only count unanswered questions from the last 7 days."""
+        tag_new = TagFactory(name="newtag", slug="newtag")
+        tag_old = TagFactory(name="oldtag", slug="oldtag")
+        # A new unanswered question — should be counted
+        QuestionFactory(product=self.product, tags=[tag_new])
+        # An old unanswered question — should not be counted under 'new'
+        QuestionFactory(
+            product=self.product,
+            created=timezone.now() - timedelta(days=10),
+            tags=[tag_old],
+        )
+        self._refresh_es()
+
+        tags = self._get_tags(product_slug="firefox", show="needs-attention", filter="new")
+        self.assertIn("newtag", tags)
+        self.assertNotIn("oldtag", tags)
+
+    def test_subfilter_recently_unanswered(self):
+        """The 'recently-unanswered' sub-filter should only count unanswered questions
+        from the last 24 hours."""
+        tag_recent = TagFactory(name="recent", slug="recent")
+        tag_stale = TagFactory(name="stale", slug="stale")
+        # Recent unanswered question
+        QuestionFactory(product=self.product, tags=[tag_recent])
+        # 2-day old unanswered question — should not be counted
+        QuestionFactory(
+            product=self.product,
+            created=timezone.now() - timedelta(hours=48),
+            tags=[tag_stale],
+        )
+        self._refresh_es()
+
+        tags = self._get_tags(product_slug="firefox", show="all", filter="recently-unanswered")
+        self.assertIn("recent", tags)
+        self.assertNotIn("stale", tags)
+
+    def test_subfilter_solved(self):
+        """The 'solved' sub-filter should only count questions with a solution."""
+        tag_solved = TagFactory(name="solved", slug="solved")
+        tag_unsolved = TagFactory(name="unsolved", slug="unsolved")
+        q_solved = QuestionFactory(product=self.product, tags=[tag_solved])
+        q_solved.solution = AnswerFactory(question=q_solved)
+        q_solved.save()
+        QuestionFactory(product=self.product, tags=[tag_unsolved])
+        self._refresh_es()
+
+        tags = self._get_tags(product_slug="firefox", show="done", filter="solved")
+        self.assertIn("solved", tags)
+        self.assertNotIn("unsolved", tags)
+
+    def test_subfilter_locked(self):
+        """The 'locked' sub-filter should only count locked questions."""
+        tag_locked = TagFactory(name="locked", slug="locked")
+        tag_unlocked = TagFactory(name="unlocked", slug="unlocked")
+        QuestionFactory(product=self.product, is_locked=True, tags=[tag_locked])
+        QuestionFactory(product=self.product, tags=[tag_unlocked])
+        self._refresh_es()
+
+        tags = self._get_tags(product_slug="firefox", show="done", filter="locked")
+        self.assertIn("locked", tags)
+        self.assertNotIn("unlocked", tags)
+
+    def test_inactive_creator_excluded(self):
+        """Tags on questions from inactive users should not appear in the sidebar."""
+        inactive_user = UserFactory(is_active=False)
+        QuestionFactory(product=self.product, creator=inactive_user, tags=[self.tag])
+        QuestionFactory(product=self.product, tags=[TagFactory(name="active", slug="active")])
+        self._refresh_es()
+
+        tags = self._get_tags(product_slug="firefox", show="all")
+        self.assertNotIn("crash", tags)
+        self.assertIn("active", tags)
 
 
 class TestQuestionList(TestCase):

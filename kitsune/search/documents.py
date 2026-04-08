@@ -141,6 +141,7 @@ class QuestionDocument(SumoDocument):
     question_has_answers = field.Boolean()
     question_last_answer_is_by_creator = field.Boolean()
     question_num_votes = field.Integer()
+    question_creator_is_active = field.Boolean()
 
     # store answer content to optimise searching for AAQ threads as a unit
     answer_content = SumoLocaleAwareTextField(multi=True, term_vector="with_positions_offsets")
@@ -167,6 +168,9 @@ class QuestionDocument(SumoDocument):
 
     def prepare_question_has_answers(self, instance):
         return instance.num_answers > 0
+
+    def prepare_question_creator_is_active(self, instance):
+        return instance.creator.is_active
 
     def prepare_question_last_answer_is_by_creator(self, instance):
         if instance.last_answer_id is None:
@@ -206,7 +210,7 @@ class QuestionDocument(SumoDocument):
     @classmethod
     def get_queryset(cls):
         return (
-            Question.objects.select_related("last_answer")
+            Question.objects.select_related("last_answer", "creator")
             # prefetch answers which aren't spam to avoid extra queries when iterating over them
             .prefetch_related(
                 Prefetch(
@@ -376,17 +380,17 @@ class ProfileDocument(SumoDocument):
         from kitsune.groups.models import GroupProfile
 
         # Get visible groups with GroupProfiles (public + moderated)
-        visible_group_profiles = GroupProfile.objects.filter(
-            group__user=instance.user
-        ).exclude(visibility=GroupProfile.Visibility.PRIVATE)
-        visible_group_ids = list(visible_group_profiles.values_list('group_id', flat=True))
+        visible_group_profiles = GroupProfile.objects.filter(group__user=instance.user).exclude(
+            visibility=GroupProfile.Visibility.PRIVATE
+        )
+        visible_group_ids = list(visible_group_profiles.values_list("group_id", flat=True))
 
         # Get groups without GroupProfiles (legacy groups) - include them by default
-        groups_with_profiles = GroupProfile.objects.filter(
-            group__user=instance.user
-        ).values_list('group_id', flat=True)
+        groups_with_profiles = GroupProfile.objects.filter(group__user=instance.user).values_list(
+            "group_id", flat=True
+        )
         legacy_group_ids = list(
-            instance.user.groups.exclude(id__in=groups_with_profiles).values_list('id', flat=True)
+            instance.user.groups.exclude(id__in=groups_with_profiles).values_list("id", flat=True)
         )
 
         # Combine visible + legacy

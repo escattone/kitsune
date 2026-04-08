@@ -435,6 +435,7 @@ def question_list(request, product_slug=None, topic_slug=None):
             topic_slug=topic_slug or None,
             topic_navigation="1" if topic_navigation else None,
             show=show,
+            filter=filter_ or None,
             tagged=tagged or None,
         )
         data["tags_url"] = tags_url
@@ -481,6 +482,10 @@ def question_tags(request):
     }
     base_list_url_with_params = urlparams(base_list_url, **preserve_params)
 
+    filter_ = request.GET.get("filter", "")
+    if filter_ not in FILTER_GROUPS.get(show, {}):
+        filter_ = None
+
     available_tags = []
     try:
         search = QuestionDocument.search()
@@ -493,57 +498,95 @@ def question_tags(request):
             search = search.filter("term", locale=locale)
         else:
             search = search.filter(
-                DSLQ("term", locale=locale)
-                | DSLQ("term", locale=settings.WIKI_DEFAULT_LANGUAGE)
+                DSLQ("term", locale=locale) | DSLQ("term", locale=settings.WIKI_DEFAULT_LANGUAGE)
             )
 
         if topic_id:
             search = search.filter("term", question_topic_id=topic_id)
 
         now = timezone.now()
-        # Base filter: 2-year window, matching question_list view
-        search = search.filter(
-            "range", question_updated={"gte": now - timedelta(days=365 * 2)}
+        # Base filters matching question_list view:
+        # 2-year window
+        search = search.filter("range", question_updated={"gte": now - timedelta(days=365 * 2)})
+        # Exclude questions older than 90 days with no answers
+        search = search.exclude(
+            DSLQ("range", question_created={"lt": now - timedelta(days=90)})
+            & DSLQ("term", question_has_answers=False)
         )
+        # Only include questions from active creators
+        search = search.filter("term", question_creator_is_active=True)
 
-        if show == "needs-attention":
-            search = (
-                search.filter("term", question_has_solution=False)
-                .filter("term", question_is_locked=False)
-                .filter("term", question_is_archived=False)
-                .filter("range", question_updated={"gte": now - timedelta(days=7)})
-                .filter(
-                    DSLQ("term", question_last_answer_is_by_creator=True)
-                    | ~DSLQ("exists", field="question_last_answer_is_by_creator")
+        # Apply sub-filter if present, otherwise fall back to the show-level filter.
+        match filter_:
+            case "new":
+                search = (
+                    search.filter("term", question_has_answers=False)
+                    .filter("term", question_is_locked=False)
+                    .filter("range", question_created={"gte": now - timedelta(days=7)})
                 )
-            )
-        elif show == "responded":
-            search = (
-                search.filter("term", question_has_solution=False)
-                .filter("term", question_is_locked=False)
-                .filter("term", question_is_archived=False)
-                .filter("exists", field="question_last_answer_is_by_creator")
-                .filter("term", question_last_answer_is_by_creator=False)
-            )
-        elif show == "done":
-            search = search.filter(
-                DSLQ("term", question_has_solution=True)
-                | DSLQ("term", question_is_locked=True)
-            )
-        # "all": no additional show filter (spam already excluded from ES index)
+            case "unhelpful-answers":
+                search = (
+                    search.filter("term", question_has_solution=False)
+                    .filter("term", question_is_locked=False)
+                    .filter("term", question_last_answer_is_by_creator=True)
+                    .filter("range", question_created={"gte": now - timedelta(days=7)})
+                )
+            case "needsinfo":
+                search = (
+                    search.filter("term", question_has_solution=False)
+                    .filter("term", question_is_locked=False)
+                    .filter("term", question_tag_slugs=config.NEEDS_INFO_TAG_NAME)
+                    .filter("exists", field="question_last_answer_is_by_creator")
+                    .filter("term", question_last_answer_is_by_creator=False)
+                )
+            case "solved":
+                search = search.filter("term", question_has_solution=True)
+            case "locked":
+                search = search.filter("term", question_is_locked=True)
+            case "recently-unanswered":
+                search = (
+                    search.filter("term", question_has_answers=False)
+                    .filter("term", question_is_locked=False)
+                    .filter("range", question_created={"gte": now - timedelta(hours=24)})
+                )
+            case _:
+                if show == "needs-attention":
+                    search = (
+                        search.filter("term", question_has_solution=False)
+                        .filter("term", question_is_locked=False)
+                        .filter("term", question_is_archived=False)
+                        .filter("range", question_updated={"gte": now - timedelta(days=7)})
+                        .filter(
+                            DSLQ("term", question_last_answer_is_by_creator=True)
+                            | ~DSLQ("exists", field="question_last_answer_is_by_creator")
+                        )
+                    )
+                elif show == "responded":
+                    search = (
+                        search.filter("term", question_has_solution=False)
+                        .filter("term", question_is_locked=False)
+                        .filter("term", question_is_archived=False)
+                        .filter("exists", field="question_last_answer_is_by_creator")
+                        .filter("term", question_last_answer_is_by_creator=False)
+                    )
+                elif show == "done":
+                    search = search.filter(
+                        DSLQ("term", question_has_solution=True)
+                        | DSLQ("term", question_is_locked=True)
+                    )
 
         TAG_AGGREGATION_SIZE = 50
         search = search.extra(size=0)
-        search.aggs.bucket("tags", DSLA("terms", field="question_tag_slugs", size=TAG_AGGREGATION_SIZE))
+        search.aggs.bucket(
+            "tags", DSLA("terms", field="question_tag_slugs", size=TAG_AGGREGATION_SIZE)
+        )
 
         result = search.execute()
         buckets = result.aggregations.tags.buckets
 
         if buckets:
             slugs = [b.key for b in buckets]
-            tag_name_map = dict(
-                SumoTag.objects.filter(slug__in=slugs).values_list("slug", "name")
-            )
+            tag_name_map = dict(SumoTag.objects.filter(slug__in=slugs).values_list("slug", "name"))
             available_tags = [
                 {"slug": b.key, "name": tag_name_map.get(b.key, b.key), "count": b.doc_count}
                 for b in buckets
