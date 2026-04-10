@@ -2075,13 +2075,15 @@ class TestDocumentLocking(TestCase):
         super().setUp()
         try:
             self.redis = redis_client("default")
-            self.redis.flushdb()
         except RedisError:
             raise SkipTest
 
     def _test_lock_helpers(self, doc):
         u1 = UserFactory()
         u2 = UserFactory()
+
+        # Clear any stale lock for this specific document.
+        self.redis.delete(f"sumo::wiki::document::{doc.id}::lock")
 
         # No one has the document locked yet.
         self.assertEqual(_document_lock_check(doc.id), None)
@@ -2114,6 +2116,9 @@ class TestDocumentLocking(TestCase):
         users can steal locks, and that when a user submits the edit page, the
         lock is cleared.
         """
+
+        # Clear any stale lock for this specific document.
+        self.redis.delete(f"sumo::wiki::document::{doc.id}::lock")
 
         def _login(user):
             self.client.login(username=user.username, password="testpass")
