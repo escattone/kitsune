@@ -82,8 +82,9 @@ urlpatterns = [
         name="questions.remove_tag_async",
     ),
     # Tag filter (HTMX partial)
-    # Note: this needs to be above questions.list because "tags" matches the product slug regex.
+    # Note: these need to be above questions.list because the slugs match the product slug regex.
     path("tags/", views.question_tags, name="questions.tags"),
+    path("inline-tags/", views.question_inline_tags, name="questions.inline_tags"),
     # Feeds
     # Note: this needs to be above questions.list because "feed"
     # matches the product slug regex.

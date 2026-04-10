@@ -198,10 +198,15 @@
 
       <div id="questions-list">
         {% if questions.object_list %}
-        <section class="forum--question-list questions">
+        <section class="forum--question-list questions"
+                 {% if show_inline_tags %}
+                 hx-get="{{ inline_tags_url }}"
+                 hx-trigger="load"
+                 hx-swap="none"
+                 {% endif %}>
           {% for question in questions.object_list %}
             <article id="question-{{ question.id }}" class="question-entry">
-              {{ question_entry(question, request=request, user_is_contributor=_user_is_contributor) }}
+              {{ question_entry(question, request=request, user_is_contributor=_user_is_contributor, show_tags=show_inline_tags) }}
             </article>
           {% endfor %}
         </section>
