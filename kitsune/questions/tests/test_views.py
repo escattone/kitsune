@@ -31,8 +31,9 @@ from kitsune.search.tests import ElasticTestCase
 from kitsune.sumo.templatetags.jinja_helpers import urlparams
 from kitsune.sumo.tests import TestCase, eq_msg, get, template_used
 from kitsune.sumo.urlresolvers import reverse
+from kitsune.tags.tests import TagFactory
 from kitsune.tidings.models import Watch
-from kitsune.users.tests import UserFactory, add_permission
+from kitsune.users.tests import ContributorFactory, UserFactory, add_permission
 
 
 class AAQSearchTests(ElasticTestCase):
@@ -860,3 +861,111 @@ class TestEditDetails(TestCase):
         response = self._request(data=data)
         # The French locale is not supported.
         self.assertEqual(400, response.status_code)
+
+
+class TestQuestionInlineTags(ElasticTestCase):
+    def setUp(self):
+        self.product = ProductFactory(slug="firefox")
+        TopicFactory(title="Fix problems", slug="fix-problems", products=[self.product])
+        ProductSupportConfigFactory(
+            product=self.product,
+            is_active=True,
+            forum_config=AAQConfigFactory(enabled_locales=QuestionLocale.objects.all()),
+            default_support_type=ProductSupportConfig.SUPPORT_TYPE_FORUM,
+        )
+        QuestionLocale.objects.get_or_create(locale=settings.LANGUAGE_CODE)
+
+        self.tag1 = TagFactory(name="crashes", slug="crashes")
+        self.tag2 = TagFactory(name="windows", slug="windows")
+
+        self.question = QuestionFactory(product=self.product)
+        self.question.tags.add(self.tag1, self.tag2)
+
+    def _url(self, **kwargs):
+        return urlparams(reverse("questions.inline_tags"), **kwargs)
+
+    def test_returns_tags_for_contributor(self):
+        user = ContributorFactory()
+        self.client.login(username=user.username, password="testpass")
+
+        response = self.client.get(
+            self._url(
+                ids=str(self.question.id),
+                product_slug=self.product.slug,
+            )
+        )
+        self.assertEqual(response.status_code, 200)
+        content = response.content.decode()
+        self.assertIn("crashes", content)
+        self.assertIn("windows", content)
+        self.assertIn(f"question-tags-{self.question.id}", content)
+        self.assertIn("hx-swap-oob", content)
+
+    def test_returns_empty_for_non_contributor(self):
+        user = UserFactory()
+        self.client.login(username=user.username, password="testpass")
+
+        response = self.client.get(
+            self._url(
+                ids=str(self.question.id),
+                product_slug=self.product.slug,
+            )
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.content, b"")
+
+    def test_returns_empty_for_anonymous_user(self):
+        response = self.client.get(
+            self._url(
+                ids=str(self.question.id),
+                product_slug=self.product.slug,
+            )
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.content, b"")
+
+    def test_returns_empty_for_missing_ids(self):
+        user = ContributorFactory()
+        self.client.login(username=user.username, password="testpass")
+
+        response = self.client.get(self._url(product_slug=self.product.slug))
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.content, b"")
+
+    def test_caps_question_ids_at_50(self):
+        user = ContributorFactory()
+        self.client.login(username=user.username, password="testpass")
+
+        ids = ",".join(str(i) for i in range(60))
+        response = self.client.get(self._url(ids=ids, product_slug=self.product.slug))
+        self.assertEqual(response.status_code, 200)
+
+    def test_active_tag_has_is_active_class(self):
+        user = ContributorFactory()
+        self.client.login(username=user.username, password="testpass")
+
+        response = self.client.get(
+            self._url(
+                ids=str(self.question.id),
+                product_slug=self.product.slug,
+                tagged="crashes",
+            )
+        )
+        content = response.content.decode()
+        self.assertIn("is-active", content)
+
+    def test_reconstructs_tag_base_url_server_side(self):
+        user = ContributorFactory()
+        self.client.login(username=user.username, password="testpass")
+
+        response = self.client.get(
+            self._url(
+                ids=str(self.question.id),
+                product_slug=self.product.slug,
+                show="all",
+            )
+        )
+        content = response.content.decode()
+        # The tag links should point to the questions list with preserved params
+        self.assertIn("/questions/firefox", content)
+        self.assertIn("show=all", content)
