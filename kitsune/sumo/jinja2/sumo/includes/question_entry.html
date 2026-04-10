@@ -74,7 +74,7 @@
   {% endif %}
 {% endmacro %}
 
-{% macro question_entry(question, profile_username=None, request=None, user_is_contributor=False) %}
+{% macro question_entry(question, profile_username=None, request=None, user_is_contributor=False, show_tags=None) %}
   {% set _base_url = url('users.questions', username=profile_username) if (question.channel == "direct_support" and profile_username) else None %}
   {% if _base_url %}
     {% set _product_url = (_base_url + '?channel=direct_support&product=' + question.product.slug) if question.product else None %}
@@ -208,4 +208,7 @@
       </span>
     {% endif %}
   </div>
+  {% if show_tags %}
+    <div id="question-tags-{{ question.id }}" class="question-entry--tags"></div>
+  {% endif %}
 {% endmacro %}

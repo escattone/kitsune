@@ -80,6 +80,7 @@ from kitsune.tidings.events import ActivationRequestFailed
 from kitsune.tidings.models import Watch
 from kitsune.upload.models import ImageAttachment
 from kitsune.users.models import Setting
+from kitsune.users.utils import user_is_contributor
 from kitsune.wiki.facets import topics_for
 from kitsune.wiki.utils import build_topics_data, get_featured_articles, get_kb_visited
 
@@ -423,6 +424,7 @@ def question_list(request, product_slug=None, topic_slug=None):
         "product_slug": product_slug,
         "topic_navigation": topic_navigation,
         "has_support_config": product_with_aaq,
+        "show_inline_tags": False,
     }
 
     if products:
@@ -439,6 +441,36 @@ def question_list(request, product_slug=None, topic_slug=None):
             tagged=tagged or None,
         )
         data["tags_url"] = tags_url
+
+        tag_base_url = urlparams(
+            reverse(
+                "questions.list_by_topic" if topic_navigation else "questions.list",
+                kwargs=(
+                    {"topic_slug": topic_slug}
+                    if topic_navigation
+                    else {"product_slug": product_slug}
+                ),
+            ),
+            **{k: v for k, v in request.GET.items() if k not in ("tagged", "page")},
+        )
+        data["tag_base_url"] = tag_base_url
+
+        data["show_inline_tags"] = user_is_contributor(request.user)
+
+        question_ids = ",".join(str(q.id) for q in questions_page)
+        data["inline_tags_url"] = urlparams(
+            reverse("questions.inline_tags"),
+            ids=question_ids,
+            product_slug=product_slug or None,
+            topic_slug=topic_slug or None,
+            topic_navigation="1" if topic_navigation else None,
+            tagged=tagged or None,
+            **{
+                k: v
+                for k, v in request.GET.items()
+                if k not in ("tagged", "page", "product_slug", "topic_slug", "topic_navigation")
+            },
+        )
 
     return render(request, "questions/question_list.html", data)
 
@@ -463,6 +495,69 @@ def _apply_question_filters(search, **kwargs):
         search = search.filter(filter_type, **{field_name: value})
 
     return search
+
+
+@require_GET
+@ratelimit("question-inline-tags", "30/m", method="GET")
+def question_inline_tags(request):
+    """Return per-question tag HTML via OOB swaps, populated from Elasticsearch."""
+    ids = request.GET.get("ids", "")
+    tagged = request.GET.get("tagged", "")
+    product_slug = request.GET.get("product_slug", "")
+    topic_slug = request.GET.get("topic_slug", "")
+    topic_navigation = request.GET.get("topic_navigation") == "1"
+
+    if not ids:
+        return HttpResponse("")
+
+    if not user_is_contributor(request.user):
+        return HttpResponse("")
+
+    # Reconstruct tag_base_url server-side (same pattern as question_tags view)
+    if topic_navigation and topic_slug:
+        base_list_url = reverse("questions.list_by_topic", kwargs={"topic_slug": topic_slug})
+    elif product_slug:
+        base_list_url = reverse("questions.list", kwargs={"product_slug": product_slug})
+    else:
+        base_list_url = reverse("questions.list", kwargs={"product_slug": "all"})
+
+    preserve_params = {
+        k: v
+        for k, v in request.GET.items()
+        if k not in ("ids", "product_slug", "topic_slug", "topic_navigation", "tagged", "page")
+    }
+    tag_base_url = urlparams(base_list_url, **preserve_params)
+
+    question_ids = ids.split(",")[: config.QUESTIONS_PER_PAGE]
+
+    question_tags = {}
+    try:
+        search = QuestionDocument.search()
+        search = search.filter("ids", values=question_ids)
+        search = search.source(includes=["question_tag_slugs"])
+        search = search.extra(size=len(question_ids))
+        for hit in search.execute():
+            slugs = list(hit.question_tag_slugs or [])
+            if slugs:
+                question_tags[hit.meta.id] = slugs
+    except Exception:
+        return HttpResponse("")
+
+    if not question_tags:
+        return HttpResponse("")
+
+    tagged_set = set(tagged.split(",")) if tagged else set()
+
+    return render(
+        request,
+        "questions/includes/inline_tags.html",
+        {
+            "question_tags": question_tags,
+            "tagged": tagged,
+            "tagged_set": tagged_set,
+            "tag_base_url": tag_base_url,
+        },
+    )
 
 
 @require_GET
