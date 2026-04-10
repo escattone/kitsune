@@ -77,6 +77,11 @@
   color: var(--color-text-light);
   margin: 0;
 
+  p:last-child,
+  .short-text {
+    margin-bottom: 0;
+  }
+
   .show-more-link {
     position: relative;
     z-index: 1;
