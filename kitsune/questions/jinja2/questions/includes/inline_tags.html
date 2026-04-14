@@ -1,6 +1,6 @@
-{% for question_id, slugs in question_tags.items() %}
+{% for question_id, tags in question_tags.items() %}
 <div id="question-tags-{{ question_id }}" class="question-entry--tags" hx-swap-oob="innerHTML:#question-tags-{{ question_id }}">
-  {% for slug in slugs %}
+  {% for slug, name in tags %}
     {% set _tag_url = tag_base_url | urlparams(tagged=toggle_tag_slug(tagged, slug), page=None) %}
     <a class="question-entry--tag{% if tagged_set and slug in tagged_set %} is-active{% endif %}"
        href="{{ _tag_url }}"
@@ -9,7 +9,7 @@
        hx-select="#questions-list"
        hx-select-oob="#tagged,#owner-tabs"
        hx-swap="outerHTML"
-       hx-push-url="true">{{ slug }}</a>
+       hx-push-url="true">{{ name }}</a>
   {% endfor %}
 </div>
 {% endfor %}

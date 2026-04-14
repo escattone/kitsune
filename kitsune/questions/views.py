@@ -442,19 +442,6 @@ def question_list(request, product_slug=None, topic_slug=None):
         )
         data["tags_url"] = tags_url
 
-        tag_base_url = urlparams(
-            reverse(
-                "questions.list_by_topic" if topic_navigation else "questions.list",
-                kwargs=(
-                    {"topic_slug": topic_slug}
-                    if topic_navigation
-                    else {"product_slug": product_slug}
-                ),
-            ),
-            **{k: v for k, v in request.GET.items() if k not in ("tagged", "page")},
-        )
-        data["tag_base_url"] = tag_base_url
-
         data["show_inline_tags"] = user_is_contributor(request.user)
 
         question_ids = ",".join(str(q.id) for q in questions_page)
@@ -521,6 +508,7 @@ def question_inline_tags(request):
 
     question_ids = ids.split(",")[: config.QUESTIONS_PER_PAGE]
 
+    all_slugs = set()
     question_tags = {}
     try:
         search = QuestionDocument.search()
@@ -530,12 +518,21 @@ def question_inline_tags(request):
         for hit in search.execute():
             slugs = list(hit.question_tag_slugs or [])
             if slugs:
+                all_slugs.update(slugs)
                 question_tags[hit.meta.id] = slugs
-    except Exception:
+    except TransportError:
         return HttpResponse("")
 
     if not question_tags:
         return HttpResponse("")
+
+    tag_name_map = dict(SumoTag.objects.filter(slug__in=all_slugs).values_list("slug", "name"))
+
+    # Replace raw slug lists with (slug, name) tuples
+    question_tags = {
+        qid: [(slug, tag_name_map.get(slug, slug)) for slug in slugs]
+        for qid, slugs in question_tags.items()
+    }
 
     tagged_set = set(tagged.split(",")) if tagged else set()
 
