@@ -93,8 +93,10 @@
   {% set has_default_forum = aaq_context.has_default_public_forum if aaq_context else False %}
   {% set multiple_products = aaq_context.multiple_products if aaq_context else False %}
   {% set is_ticketed = (current_support == 'zendesk') if current_support else False %}
+  {% set is_enterprise = (product.slug == "firefox-enterprise") if product else False %}
+  {% set enterprise_logged_out_url = "https://qsurvey.mozilla.com/s3/firefox-support-plan?src=sumo-products-firefox-enterprise" %}
 
-  {% if (not product) or has_forum or is_ticketed or has_default_forum %}
+  {% if (not product) or has_forum or is_ticketed or has_default_forum or is_enterprise %}
   <div class="aaq-widget card is-inverse elevation-01 text-center radius-md">
     <h2 class="card--title has-bottom-margin">
       <svg class="card--icon-sm" width="24px" height="24px" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
@@ -106,9 +108,19 @@
         </g>
       </svg>
 
-      {{ _('Ask a Question') }}
+      {% if is_enterprise and is_ticketed %}
+        {{ _('Partner Support') }}
+      {% elif is_enterprise and not request.user.is_authenticated %}
+        {{ _('Support for Organizations') }}
+      {% else %}
+        {{ _('Ask a Question') }}
+      {% endif %}
     </h2>
-    {% if aaq_context %}
+    {% if is_enterprise and is_ticketed %}
+      <p>{{ _("Get dedicated technical assistance and deployment guidance from our team, with expert support tailored to your organization's needs.") }}</p>
+    {% elif is_enterprise and not request.user.is_authenticated %}
+      <p>{{ _("Dedicated technical assistance and deployment guidance are available to Firefox Support for Organizations customers.") }}</p>
+    {% elif aaq_context %}
       {% if request.user.is_authenticated %}
         {% if is_ticketed %}
           {# L10n: Text for the Ask a Question CTA widget (case: Premium products; the user is signed in). #}
@@ -134,7 +146,8 @@
     {% set link_name = "aaq-widget.community-support.kb-article" if not (is_ticketed or has_forum)
                       else "aaq-widget.aaq-step-3" %}
 
-    {% set next_step = get_aaq_url(aaq_context or {}, topic) %}
+    {% set next_step = enterprise_logged_out_url if (is_enterprise and not request.user.is_authenticated)
+                      else get_aaq_url(aaq_context or {}, topic) %}
 
     {% set link_detail = aaq_context.product_slug if aaq_context else topic %}
 
@@ -145,8 +158,14 @@
         "link_name": "{{ link_name }}",
         "link_detail": "{{ link_detail }}"
       }'>
-      {# L10n: A button. #}
-      {{ _('Continue')}}
+      {% if is_enterprise and not request.user.is_authenticated %}
+        {{ _("Talk to an Expert") }}
+      {% elif is_enterprise and is_ticketed %}
+        {{ _("Contact Support") }}
+      {% else %}
+        {# L10n: A button. #}
+        {{ _('Continue') }}
+      {% endif %}
     </a>
   </div>
   {% endif %}
