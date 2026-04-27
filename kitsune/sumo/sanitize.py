@@ -79,7 +79,6 @@ def _decide_unserializable_tags(node):
 
 
 ALLOWED_BIO_TAGS = {
-    "a",
     "abbr",
     "acronym",
     "b",
@@ -94,7 +93,6 @@ ALLOWED_BIO_TAGS = {
     "p",
 }
 ALLOWED_BIO_ATTRIBUTES = {
-    "a": ["href", "title", "rel"],
     "abbr": ["title"],
     "acronym": ["title"],
 }

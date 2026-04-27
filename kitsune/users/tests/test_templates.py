@@ -137,13 +137,23 @@ class ViewProfileTests(TestCase):
         )
         self.client.logout()
 
-    def test_bio_links_nofollow(self):
+    def test_bio_links_stripped(self):
         self.profile.bio = "http://getseo.com, [http://getseo.com]"
         self.profile.save()
         r = self.client.get(reverse("users.profile", args=[self.u.username]))
         self.assertEqual(200, r.status_code)
         doc = pq(r.content)
-        self.assertEqual(2, len(doc('.bio a[rel="nofollow"]')))
+        self.assertEqual(0, len(doc(".bio a")))
+        self.assertIn("http://getseo.com", doc(".bio").text())
+
+    def test_bio_anchor_tag_stripped(self):
+        self.profile.bio = '<p>visit <a href="https://example.com">my site</a> please</p>'
+        self.profile.save()
+        r = self.client.get(reverse("users.profile", args=[self.u.username]))
+        self.assertEqual(200, r.status_code)
+        doc = pq(r.content)
+        self.assertEqual(0, len(doc(".bio a")))
+        self.assertIn("my site", doc(".bio").text())
 
     def test_bio_links_no_img(self):
         # bug 1427813
