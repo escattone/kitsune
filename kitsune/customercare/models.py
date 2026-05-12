@@ -1,6 +1,11 @@
+from datetime import timedelta
+
+from django.conf import settings
 from django.contrib.auth.models import User
 from django.db import models
 from django.urls import reverse
+from django.utils import timezone
+from django.utils.dateparse import parse_datetime
 from django.utils.translation import gettext_lazy as _lazy
 
 from kitsune.products.models import Product, Topic
@@ -69,6 +74,7 @@ class SupportTicket(ModelBase):
     zd_updated_at = models.DateTimeField(null=True, blank=True)
     last_synced_at = models.DateTimeField(null=True, blank=True)
     comments = models.JSONField(default=list, blank=True)
+    pending_comment = models.JSONField(default=dict, blank=True)
     internal_zd_tags = models.JSONField(default=list, blank=True)
     created = models.DateTimeField(auto_now_add=True, db_index=True)
 
@@ -106,6 +112,24 @@ class SupportTicket(ModelBase):
         # would be a webhook-appended reply.
         first_reply_index = 0 if self.last_synced_at is None else 1
         return [c for c in self.comments[first_reply_index:] if c.get("public", False)]
+
+    @property
+    def effective_pending_comment(self):
+        """A pending comment with a stale status of "sending" is coerced to "failed".
+
+        If the task is still "sending" past ZENDESK_REPLY_POLL_SECONDS, callers see
+        a failed state.
+        """
+        pending = self.pending_comment
+        if not pending or pending.get("status") != "sending":
+            return pending
+        last = pending.get("last_attempted_at")
+        if not last:
+            return pending
+        threshold = timezone.now() - timedelta(seconds=settings.ZENDESK_REPLY_POLL_SECONDS)
+        if parse_datetime(last) > threshold:
+            return pending
+        return {**pending, "status": "failed", "allow_retries": True}
 
     @property
     def user_status(self):

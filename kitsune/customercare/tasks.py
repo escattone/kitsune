@@ -1,15 +1,19 @@
 import logging
+from contextlib import contextmanager
 from datetime import timedelta
 
+import requests
 from celery import group, shared_task
 from django.contrib.auth.models import User
 from django.contrib.contenttypes.models import ContentType
 from django.db import transaction
 from django.utils import timezone
 from django.utils.dateparse import parse_datetime
+from zenpy.lib.exception import APIException
 
 from kitsune.customercare.models import SupportTicket
 from kitsune.customercare.utils import (
+    is_permanent_zendesk_error,
     process_zendesk_classification_result,
     sync_ticket_from_zendesk,
 )
@@ -138,6 +142,145 @@ def process_failed_zendesk_tickets() -> None:
 
 
 @shared_task
+def post_reply_to_zendesk(ticket_id: int) -> None:
+    """Post the ticket's pending_comment to Zendesk and clear it on success.
+
+    Single try, no auto-retry. The user retries via the reply form (same body =
+    re-attempt, different body = replace). On a re-attempt (attempts > 0), the
+    task first refreshes the comments from Zendesk and checks whether a prior
+    attempt's comment already landed — if so, drop the pending comment to avoid
+    double posting.
+
+    On any exception, mark the pending as failed and re-raise unless it's a
+    transient APIException/RequestException — permanent and unknown exceptions
+    propagate to Celery so Sentry captures them.
+    """
+    try:
+        ticket = SupportTicket.objects.select_related("user").get(id=ticket_id)
+
+        if not (user := ticket.user):
+            _mark_pending_failed(ticket_id, allow_retries=False)
+            return
+
+        pending_snapshot = ticket.pending_comment
+        if not pending_snapshot or pending_snapshot.get("status") != "sending":
+            return
+
+        author_zd_id = int(user.profile.zendesk_id) if user.profile.zendesk_id else None
+
+        # Refresh comments and check whether a prior attempt already posted, in order
+        # to avoid double posting.
+        if pending_snapshot.get("attempts", 0) > 0 and pending_snapshot.get("last_attempted_at"):
+            sync_ticket_from_zendesk(ticket)
+            lower_bound = parse_datetime(pending_snapshot["last_attempted_at"])
+            matched = any(
+                c["author"]["id"] == author_zd_id
+                and c["body"] == pending_snapshot["body"]
+                and c["public"]
+                and c["created_at"]
+                and parse_datetime(c["created_at"]) >= lower_bound
+                for c in ticket.comments
+            )
+            if matched:
+                with _locked_ticket(ticket_id) as ticket:
+                    if ticket.pending_comment.get("body") == pending_snapshot["body"]:
+                        ticket.pending_comment = {}
+                        ticket.save(update_fields=["pending_comment"])
+                return
+
+        # Record this attempt before the post so a future verify sees its window.
+        with _locked_ticket(ticket_id) as ticket:
+            if ticket.pending_comment.get("body") != pending_snapshot["body"]:
+                # User replaced the pending while we were running. Abandon.
+                return
+            ticket.pending_comment["attempts"] = ticket.pending_comment.get("attempts", 0) + 1
+            ticket.pending_comment["last_attempted_at"] = timezone.now().isoformat()
+            ticket.save(update_fields=["pending_comment"])
+
+        ticket_audit = ZendeskClient().add_ticket_comment(
+            user=user,
+            ticket_id=int(ticket.zendesk_ticket_id),
+            comment_body=pending_snapshot["body"],
+            public=True,
+        )
+
+        new_comment = next(
+            (
+                ev
+                for ev in ticket_audit.audit.events
+                if isinstance(ev, dict) and ev.get("type") == "Comment" and ev.get("id")
+            ),
+            None,
+        )
+        if new_comment is None:
+            raise ValueError(
+                f"Zendesk audit had no comment event for ticket {ticket.zendesk_ticket_id}"
+            )
+
+        # Append the actual comment and clear the pending comment if it still matches
+        # what we posted. If the user has replaced the pending comment mid-flight
+        # (different body), we leave their new pending comment alone.
+        with _locked_ticket(ticket_id) as ticket:
+            new_id = new_comment["id"]
+            fields = []
+            if not any(c.get("id") == new_id for c in ticket.comments):
+                ticket.comments.append(
+                    {
+                        "id": new_id,
+                        "body": new_comment.get("body", ""),
+                        "created_at": ticket_audit.ticket.updated_at,
+                        "public": True,
+                        "author": {
+                            "name": user.profile.display_name,
+                            "id": author_zd_id,
+                        },
+                    }
+                )
+                fields.append("comments")
+            if ticket.pending_comment.get("body") == pending_snapshot["body"]:
+                ticket.pending_comment = {}
+                fields.append("pending_comment")
+            if fields:
+                ticket.save(update_fields=fields)
+    except SupportTicket.DoesNotExist:
+        return
+    except Exception as exc:
+        log.exception(f"Failed to post reply for ticket id {ticket_id}")
+        allow_retries = isinstance(
+            exc, APIException | requests.exceptions.RequestException
+        ) and not is_permanent_zendesk_error(exc)
+        _mark_pending_failed(ticket_id, allow_retries=allow_retries)
+        if allow_retries:
+            return
+        raise
+
+
+@contextmanager
+def _locked_ticket(ticket_id):
+    """Open a transaction and yield the SupportTicket under a row lock.
+
+    Used to bracket read-modify-write sequences on "pending_comment" and
+    "comments". The lock is held until the transaction exits.
+    """
+    with transaction.atomic():
+        yield SupportTicket.objects.select_for_update().get(id=ticket_id)
+
+
+def _mark_pending_failed(ticket_id, allow_retries):
+    """Mark the pending_comment as failed under a row lock.
+
+    No-op if pending_comment is empty or its status is no longer "sending"
+    (e.g., user replaced it while we were running).
+    """
+    with _locked_ticket(ticket_id) as ticket:
+        if ticket.pending_comment.get("status") != "sending":
+            return
+        ticket.pending_comment["status"] = "failed"
+        ticket.pending_comment["allow_retries"] = allow_retries
+        ticket.save(update_fields=["pending_comment"])
+
+
+@shared_task
 @skip_if_read_only_mode
 def process_zendesk_update(payload: dict) -> None:
     """
@@ -183,10 +326,14 @@ def process_zendesk_update(payload: dict) -> None:
             comment = event.get("comment")
             if not isinstance(comment, dict):
                 raise ValueError("Unexpected comment structure from Zendesk")
-            comment["created_at"] = updated_at
-            comment["public"] = comment.pop("is_public", False)
-            ticket.comments.append(comment)
-            update_fields.append("comments")
+            # Skip if the incoming comment "id" is already present.
+            if (comment_id := comment.get("id")) and not any(
+                c.get("id") == comment_id for c in ticket.comments
+            ):
+                comment["created_at"] = updated_at
+                comment["public"] = comment.pop("is_public", False)
+                ticket.comments.append(comment)
+                update_fields.append("comments")
 
         if update_fields:
             ticket.zd_updated_at = parse_datetime(updated_at)
