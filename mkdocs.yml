@@ -84,6 +84,7 @@ nav:
         - svelte.md
         - browser_permissions.md
         - zendesk.md
+        - mozilla-connect.md
         - seo.md
         - notes.md
         - switching_devices.md
