@@ -78,7 +78,15 @@ GCS_BUCKET = "gs://sumo-prod-prod-connect-images"
 DEFAULT_OUT = Path.home() / "connect-export"
 
 LIQL_LIMIT = 1000  # Khoros caps LIMIT at 1000.
-REQUEST_PAUSE = 0.25
+# 0.25s draws a 429 on roughly one request in seven; 0.5s draws none at all.
+# The retries cope either way, and the shorter pause is barely faster once the
+# retry waits are counted -- about 0.70s per request against 0.80s -- so the
+# only real difference is how hard we lean on a production service.
+#
+# Note this applies to API calls only. Image downloads run concurrently with no
+# per-request pause: they come from a Cloudflare-fronted service that handled
+# 14,586 files at roughly 12 a second without a single 429.
+REQUEST_PAUSE = 0.5
 # 8 attempts of doubling waits adds up to about four minutes.
 #
 # Khoros throttles, and it isn't rare: on a long run at roughly 4 requests a
@@ -211,7 +219,16 @@ class KhorosClient:
         url = f"{self.base}/search?q={quote(liql)}"
 
         for attempt in range(MAX_RETRIES):
-            response = self.session.get(url, timeout=90)
+            try:
+                response = self.session.get(url, timeout=90)
+            except requests.RequestException as exc:
+                # Timeouts and dropped connections are as transient as a 429 and
+                # just as survivable. A read timeout on one slow page killed a
+                # whole sync before this was here.
+                wait = 2**attempt
+                print(f"  {type(exc).__name__}, retrying in {wait}s", file=sys.stderr)
+                time.sleep(wait)
+                continue
 
             # 429 = rate limited, 5xx = transient. Back off and retry.
             if response.status_code == 429 or response.status_code >= 500:
@@ -533,20 +550,25 @@ def read_ndjson_dir(directory):
 
 
 def khoros_inline_ids(board_dir):
-    """Map each message to the Khoros image IDs already found in its body.
+    """What each message's body HTML already gave us, per message.
 
-    Only images with an image_id count. A body can also link images hosted
-    elsewhere -- imgur, github and so on -- and those aren't in the images
-    collection, so counting them would hide a genuine shortfall.
+    Returns {message_uid: {"known": set_of_khoros_image_ids, "next": position}}.
 
-    Returning the IDs rather than a tally also lets the API pass skip images it
-    has already seen, instead of recording them twice.
+    Only images with an image_id go in "known". A body can also link images
+    hosted elsewhere -- imgur, github and so on -- and those aren't in the
+    images collection, so counting them would hide a genuine shortfall.
+
+    "next" is a different count: the position the API pass should start
+    numbering from. It counts every inline image, external ones included,
+    because they all occupy a position.
     """
     seen = {}
     for path in sorted(board_dir.glob("images_*.ndjson")):
         for row in read_ndjson(path):
+            entry = seen.setdefault(row["message_uid"], {"known": set(), "next": 0})
             if row.get("image_id"):
-                seen.setdefault(row["message_uid"], set()).add(row["image_id"])
+                entry["known"].add(row["image_id"])
+            entry["next"] = max(entry["next"], row["position"] + 1)
     return seen
 
 
@@ -647,20 +669,24 @@ def recover_missing_images(client, root):
             continue
         inline = khoros_inline_ids(board_dir)
         for row in read_ndjson_dir(board_dir):
-            already = inline.get(row["message_uid"], set())
-            if (row.get("image_count") or 0) > len(already):
-                need.append((row["message_uid"], already))
+            entry = inline.get(row["message_uid"], {"known": set(), "next": 0})
+            if (row.get("image_count") or 0) > len(entry["known"]):
+                need.append((row["message_uid"], entry))
 
     print(f"{len(need)} messages have images missing from their body HTML")
     rows = []
-    for index, (uid, already) in enumerate(need, 1):
+    for index, (uid, entry) in enumerate(need, 1):
         # LIMIT is not optional -- LiQL defaults to 25 rows without one.
         data = client.query(f"SELECT * FROM images WHERE messages.id = '{uid}' LIMIT {LIQL_LIMIT}")
-        position = 0
+        # Carry on numbering from the last inline image. Restarting at zero
+        # gives two rows the same (message_uid, position), which BigQuery
+        # tolerates but which is wrong -- and is a lost row anywhere that pair
+        # is treated as a key, as it is in the Fivetran connector.
+        position = entry["next"]
         for item in data.get("items", []):
             # The API returns every image on the message, including any the body
             # already gave us. Keep only the ones we're missing.
-            if item.get("id") in already:
+            if item.get("id") in entry["known"]:
                 continue
             rows.append(
                 {
@@ -710,7 +736,15 @@ def download_image(session, domain, image_id, variant, out_dir):
         return None
 
     for attempt in range(MAX_RETRIES):
-        response = session.get(url, timeout=90)
+        try:
+            response = session.get(url, timeout=90)
+        except requests.RequestException as exc:
+            # One timeout among 14,000 downloads should cost a retry, not the run.
+            wait = 2**attempt
+            print(f"  {type(exc).__name__} on {image_id}, waiting {wait}s", file=sys.stderr)
+            time.sleep(wait)
+            continue
+
         if response.status_code == 429 or response.status_code >= 500:
             wait = backoff_seconds(response, attempt)
             print(
