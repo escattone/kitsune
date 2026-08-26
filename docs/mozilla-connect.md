@@ -8,7 +8,8 @@ title: Mozilla Connect (Khoros) API
 page documents its API as we actually found it, so we can pull Connect content
 into BigQuery.
 
-`scripts/khoros_export.py` is the exporter built on top of this.
+There are two tools built on top of this — see [Two ways to
+export](#two-ways-to-export) below for which to reach for.
 
 Khoros is SaaS, so there is no database schema to read. What we have is the
 **LiQL collection model** — the API's view of the data. Everything below was
@@ -17,6 +18,58 @@ we can actually reach, not just what Khoros documents.
 
 Endpoint: `GET https://connect.mozilla.org/api/2.0/search?q=<LiQL>`
 No credentials needed for public content, post bodies included.
+
+## Two ways to export
+
+| | `scripts/khoros_export.py` | `fivetran/khoros/connector.py` |
+|---|---|---|
+| Runs | by hand, when you ask | on a Fivetran schedule |
+| Lands in | `mozilla_connect_content` + a GCS bucket, both ours | the Fivetran destination, in a schema named on the connection |
+| Deletions | never noticed | `_fivetran_deleted` set on anything that vanished |
+| Partitioning | month on `post_time`, clustered on the join keys | Fivetran owns the DDL |
+| Image sizes | recorded in bytes | not recorded (see below) |
+| Local copy | ~2.5 GB on disk | nothing kept |
+
+Both read the same API, produce the same rows, and have been checked against
+each other table by table. Neither is incremental: Khoros cannot answer "what
+changed since Tuesday", so every run is a full re-sweep.
+
+The script is the better tool for ad-hoc work and backfills — you can inspect
+the NDJSON before it goes anywhere, and it owns its own dataset. The connector
+is the better tool for keeping BigQuery current without anyone remembering to
+run it.
+
+### Where they genuinely differ
+
+**Deletions.** The connector calls `truncate()` at the start of a fresh sweep,
+which soft-deletes every row; the upserts that follow clear the flag on
+everything still present, so whatever the source dropped keeps
+`_fivetran_deleted = TRUE`. Costs no extra requests. The script has no
+equivalent — a sweep of upserts can never say "this post is gone", so deleted
+threads linger in its tables indefinitely.
+
+**Image file sizes.** Khoros sends no `Content-Length` on image responses. The
+script reports sizes only because it downloads each file into memory and
+measures it. The connector streams straight through to Fivetran, so it never
+sees a total and has no `bytes` column at all.
+
+**Image paths.** The script writes `<variant>/<filename>` into a bucket it
+controls. The connector hands Fivetran the same relative path, which lands under
+`<schema>/image_files/<variant>/<filename>`. Read `_fivetran_file_path` rather
+than assuming either layout.
+
+### Two prerequisites before the connector can run for real
+
+Both are account-side and need Fivetran, not code:
+
+1. **Unstructured file replication enabled.** Without it the SDK refuses every
+   upload with "File uploads are not enabled for this connector". Locally you can
+   set `CONNECTOR_SDK_SUPPORT_UNSTRUCTURED_DATA=true` to test, but production
+   needs it switched on properly.
+2. **A GCS bucket set on the BigQuery destination**, in the same location as the
+   dataset. `gs://sumo-prod-prod-connect-images` was moved to US multi-region for
+   this reason — the dataset is US, and a US-WEST1 bucket would not have
+   qualified.
 
 ## Collection map
 
