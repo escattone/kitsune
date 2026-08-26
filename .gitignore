@@ -80,3 +80,13 @@ gcloud/
 .superpowers
 .claude.json
 .idea
+
+# Fivetran Connector SDK local config -- may hold a session_key, and is
+# uploaded to the connection at deploy time rather than read at sync time.
+# See fivetran/*/configuration.example.json for the shape.
+fivetran/*/configuration.json
+
+# Fivetran Connector SDK local test output
+fivetran/*/files/
+fivetran/*/warehouse.db
+.ft_sdk_connector_tester/
