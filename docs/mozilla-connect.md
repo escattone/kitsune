@@ -8,8 +8,9 @@ title: Mozilla Connect (Khoros) API
 page documents its API as we actually found it, so we can pull Connect content
 into BigQuery.
 
-There are two tools built on top of this — see [Two ways to
-export](#two-ways-to-export) below for which to reach for.
+To pull the data, see [Running the export](#running-the-export) — one command.
+There is also a Fivetran connector, currently paused; [Two ways to
+export](#two-ways-to-export) compares them.
 
 Khoros is SaaS, so there is no database schema to read. What we have is the
 **LiQL collection model** — the API's view of the data. Everything below was
@@ -19,13 +20,52 @@ we can actually reach, not just what Khoros documents.
 Endpoint: `GET https://connect.mozilla.org/api/2.0/search?q=<LiQL>`
 No credentials needed for public content, post bodies included.
 
+## Running the export
+
+One command:
+
+```
+uv run scripts/connect_export.py refresh
+```
+
+That clears the old data, fetches everything, and loads it into BigQuery and the
+GCS bucket. **About three hours**, nearly all of it labels and tags — those need
+one request per message and there are roughly 13,000 of them.
+
+It checks Khoros, BigQuery and the bucket first, so a stale `gcloud` token or a
+typo fails in seconds rather than after three hours.
+
+If a step fails, everything up to it is saved. Carry on with:
+
+```
+uv run scripts/connect_export.py refresh --resume
+```
+
+Without `--resume` it starts over, throwing that progress away. The failure
+message says this too.
+
+Output goes to `~/connect-export` (about 2.5 GB) unless you pass `--out`.
+Individual steps — `fetch-messages`, `fetch-labels`, `fetch-images`, `load`,
+`clean` and so on — are there for redoing one part; run `--help` for the list.
+
+⚠️ **If you run the steps by hand, clean first.** Each fetch step skips whatever
+it already has, so without a clean the run finishes in seconds, reports success,
+and picks up nothing new. There is no warning. `refresh` does the clean for you,
+which is the main reason to prefer it.
+
 ## Two ways to export
 
-| | `scripts/khoros_export.py` | `fivetran/khoros/connector.py` |
+**Use `scripts/connect_export.py`.** The Fivetran connector alongside it works and
+was checked table by table against the script, but it is **paused and was never
+deployed** — see [why](#why-the-connector-is-paused) below. It is kept in case
+the blockers clear.
+
+| | `scripts/connect_export.py` | `fivetran/khoros/connector.py` |
 |---|---|---|
-| Runs | by hand, when you ask | on a Fivetran schedule |
+| Status | **in use** | paused, never deployed |
+| Runs | by hand, when you ask | would run on a Fivetran schedule |
 | Lands in | `mozilla_connect_content` + a GCS bucket, both ours | the Fivetran destination, in a schema named on the connection |
-| Deletions | never noticed | `_fivetran_deleted` set on anything that vanished |
+| Deletions | row disappears, because each load replaces the table | row stays, flagged `_fivetran_deleted` |
 | Partitioning | month on `post_time`, clustered on the join keys | Fivetran owns the DDL |
 | Image sizes | recorded in bytes | not recorded (see below) |
 | Local copy | ~2.5 GB on disk | nothing kept |
@@ -34,19 +74,50 @@ Both read the same API, produce the same rows, and have been checked against
 each other table by table. Neither is incremental: Khoros cannot answer "what
 changed since Tuesday", so every run is a full re-sweep.
 
-The script is the better tool for ad-hoc work and backfills — you can inspect
-the NDJSON before it goes anywhere, and it owns its own dataset. The connector
-is the better tool for keeping BigQuery current without anyone remembering to
-run it.
+### Why the connector is paused
+
+Two reasons, and the second is the one that mattered.
+
+**It needs account changes we don't control.** Two of them:
+
+1. **Unstructured file replication, enabled on the Fivetran account.** Without
+   it the SDK refuses every upload with "File uploads are not enabled for this
+   connector". Locally you can set `CONNECTOR_SDK_SUPPORT_UNSTRUCTURED_DATA=true`
+   to test, which is how we verified the image path works, but production needs
+   it switched on properly.
+2. **A GCS bucket set on the BigQuery destination**, in the same location as the
+   dataset. That destination is shared with other connections, including the one
+   feeding `mozilla_connect`, so it isn't ours to change.
+   `gs://sumo-prod-prod-connect-images` was moved from US-WEST1 to US
+   multi-region to satisfy the location rule — the dataset is US, and a
+   single-region bucket would not have qualified.
+
+**Scheduling buys less than it looks.** Khoros cannot answer "what changed since
+Tuesday", so every sync re-sweeps all 93,000 messages regardless. A scheduled
+connector would spend three hours doing that on a timer instead of when someone
+wants it, which is most of the appeal gone.
+
+The connector is worth keeping — it works, and it took real effort to establish
+what the API will and won't do. If the account side ever clears, it is ready.
 
 ### Where they genuinely differ
 
-**Deletions.** The connector calls `truncate()` at the start of a fresh sweep,
-which soft-deletes every row; the upserts that follow clear the flag on
-everything still present, so whatever the source dropped keeps
-`_fivetran_deleted = TRUE`. Costs no extra requests. The script has no
-equivalent — a sweep of upserts can never say "this post is gone", so deleted
-threads linger in its tables indefinitely.
+**Deletions.** Both handle them, differently.
+
+The script loads with `bq load --replace`, so each table is rewritten from
+scratch. A post deleted on Connect is simply absent afterwards — a hard delete,
+for free, with nothing to remember.
+
+The connector cannot do that, because it sends rows one at a time rather than
+replacing a table. Instead it calls `truncate()` at the start of a fresh sweep,
+which marks every existing row `_fivetran_deleted = TRUE`; the upserts that
+follow clear the flag on everything still present, leaving the flag set on
+whatever the source dropped. A soft delete, so those rows stay in the table and
+queries need `WHERE NOT _fivetran_deleted`.
+
+For most purposes the script's behaviour is the more convenient of the two. The
+connector's is more informative, since a flagged row is a record that the post
+once existed.
 
 **Image file sizes.** Khoros sends no `Content-Length` on image responses. The
 script reports sizes only because it downloads each file into memory and
@@ -58,18 +129,277 @@ controls. The connector hands Fivetran the same relative path, which lands under
 `<schema>/image_files/<variant>/<filename>`. Read `_fivetran_file_path` rather
 than assuming either layout.
 
-### Two prerequisites before the connector can run for real
+## What lands in BigQuery
 
-Both are account-side and need Fivetran, not code:
+Eight tables in `moz-fx-sumo-prod.mozilla_connect_content`, plus the image files
+in `gs://sumo-prod-prod-connect-images`.
 
-1. **Unstructured file replication enabled.** Without it the SDK refuses every
-   upload with "File uploads are not enabled for this connector". Locally you can
-   set `CONNECTOR_SDK_SUPPORT_UNSTRUCTURED_DATA=true` to test, but production
-   needs it switched on properly.
-2. **A GCS bucket set on the BigQuery destination**, in the same location as the
-   dataset. `gs://sumo-prod-prod-connect-images` was moved to US multi-region for
-   this reason — the dataset is US, and a US-WEST1 bucket would not have
-   qualified.
+```mermaid
+erDiagram
+    messages {
+        integer message_uid PK
+        integer conversation_uid FK
+        integer parent_message_uid FK
+        integer topic_message_uid FK
+        integer depth
+        boolean is_topic
+        boolean is_image_comment
+        string board_slug FK
+        string message_type
+        string href
+        string view_href
+        string subject
+        string body_html
+        integer body_chars
+        string teaser
+        string search_snippet
+        string language
+        timestamp post_time
+        timestamp last_publish_time
+        string thread_style
+        integer thread_messages_count
+        boolean thread_solved
+        timestamp thread_last_post_time
+        integer author_uid FK
+        string author_login
+        string revision_id
+        integer revision_num
+        timestamp last_edit_time
+        string last_edit_author_login
+        string status_key
+        string status_name
+        boolean status_completed
+        string moderation_status
+        boolean is_solution
+        boolean can_accept_solution
+        boolean read_only
+        boolean edit_frozen
+        boolean is_promoted
+        boolean placeholder
+        boolean excluded_from_kudos_leaderboards
+        float popularity
+        integer views
+        integer kudos_weight
+        integer reply_count
+        integer label_count
+        integer tag_count
+        integer image_count
+    }
+    message_authors {
+        integer user_uid PK
+        string login
+        string view_href
+        integer rank_id FK
+        string rank_name
+        integer rank_position
+        timestamp last_visit_time
+        string online_status
+        boolean deleted
+    }
+    message_images {
+        integer message_uid PK, FK
+        integer position PK
+        string image_id FK
+        string url
+        string source
+    }
+    message_labels {
+        integer message_uid PK, FK
+        string label PK
+    }
+    message_tags {
+        integer message_uid PK, FK
+        integer tag_id PK
+        string tag
+    }
+    image_files {
+        string image_id PK
+        string variant PK
+        string filename
+        integer bytes
+        string content_type
+        string source_url
+        string gcs_uri
+    }
+    boards {
+        string id PK
+        string title
+        string short_title
+        string description
+        string conversation_style
+        timestamp creation_date
+        integer views
+        integer position
+        integer depth
+        boolean hidden
+        string language
+        string rating
+        string allowed_labels
+        boolean require_thread_root_label
+        boolean comments_enabled
+        string view_href
+    }
+    ranks {
+        integer id PK
+        string name
+        integer position
+        boolean bold
+        string color
+        string rank_status
+        boolean formula_enabled
+    }
+
+    messages ||--o{ messages : "replies to"
+    messages ||--o{ message_images : "shows"
+    messages ||--o{ message_labels : "tagged with"
+    messages ||--o{ message_tags : "tagged with"
+    messages }o--|| message_authors : "written by"
+    messages }o--|| boards : "posted in"
+    message_images }o--o| image_files : "3 sizes of"
+    message_authors }o--|| ranks : "ranked"
+```
+
+`messages` is the centre of it. Everything else either describes a message, or
+describes something a message points at.
+
+Every column is listed above with the type BigQuery gives it. The sections below
+say what each one means.
+
+### messages — one row per post, 92,385 of them
+
+**Where it sits in the thread**
+
+| Column | Meaning |
+|---|---|
+| `message_uid` | The post's own ID. Primary key. |
+| `conversation_uid` | The thread's ID, which is the opening post's `message_uid`. |
+| `parent_message_uid` | The post being replied to. Null on thread openers. |
+| `topic_message_uid` | **Always identical to `conversation_uid`** — 0 differences across all 92,385 rows. Kept only because Khoros returns both. |
+| `depth` | 0 for a thread opener, higher for replies. Null on ~782 rows (see the count discrepancy above). |
+| `is_topic` | True for thread openers. Equals `depth = 0` in every row. |
+| `board_slug` | Joins to `boards.id`. |
+| `message_type` | `forum_topic_message`, `idea_topic_message`, `forum_reply_message`, and so on. |
+| `is_image_comment` | Always null. Kept as a signal: if it ever fills in, those 782 unreachable messages became reachable. |
+
+Threading is genuinely nested, not flat: 62,060 replies point at the thread
+root, but **11,371 point at another reply**. So to rebuild a conversation, follow
+`parent_message_uid`, not `conversation_uid`.
+
+**What was written**
+
+| Column | Meaning |
+|---|---|
+| `subject` | The post title. |
+| `body_html` | The post itself, as HTML. This is the thing the whole export exists for. |
+| `body_chars` | Length of `body_html`. |
+| `search_snippet` | A plain-text extract Khoros builds. Not simply the first N characters — 17,049 rows are not a prefix of the body — so it is useful if you want text without parsing HTML. |
+| `teaser` | Always empty on Connect. |
+| `language` | Always `EN`. |
+| `href`, `view_href` | The API path and the real public URL of the post. |
+
+**When**
+
+`post_time` · `last_publish_time` · `last_edit_time` (from the current revision)
+
+**Who**
+
+`author_uid` joins to `message_authors.user_uid`. `author_login` is denormalised
+onto the row so simple queries need no join. `revision_id`, `revision_num` and
+`last_edit_author_login` describe the most recent edit.
+
+**Ideas workflow** — null on forum posts
+
+`status_key` (`new`) · `status_name` (`New idea`, `Delivered`) ·
+`status_completed`. Ideas is the largest board, so this is how you find which
+requests shipped.
+
+**How it did**
+
+| Column | Meaning |
+|---|---|
+| `views` | View count. |
+| `kudos_weight` | Total kudos. On the Ideas board a kudo is a **vote**, so this is the vote count. |
+| `popularity` | Khoros's own decaying score. Frequently negative; not a percentage of anything. |
+| `thread_messages_count`, `thread_solved`, `thread_last_post_time`, `thread_style` | Facts about the whole thread, repeated on every post in it. |
+| `reply_count` | Direct replies to this post. |
+
+**Counts that drive the export**
+
+`label_count`, `tag_count`, `image_count` come free with each message and are
+what let the export skip messages with nothing to fetch. They are also the check
+that caught a real bug: the totals in `message_labels` and `message_tags` must
+match `SUM(label_count)` and `SUM(tag_count)`, and one mismatch revealed that
+Khoros silently truncates at 25 rows.
+
+**Flags that never vary** — all `false` on every row today
+
+`can_accept_solution` · `edit_frozen` · `is_promoted` · `placeholder` ·
+`excluded_from_kudos_leaderboards`. `moderation_status` is always `approved`,
+because we only see public content. Kept so that a change in Connect's settings
+would show up rather than being invisible. `is_solution` and `read_only` do vary.
+
+### message_authors — 39,659 people who have posted
+
+Not called `users` on purpose. Khoros's `users` collection returns zero rows to
+anonymous callers, so this is built up from post authors as the export sweeps.
+It covers people who have **posted**, not everyone registered, and it has no
+registration dates or lifetime kudos totals.
+
+`user_uid` (PK) · `login` · `view_href` (profile URL) · `rank_id` joins to
+`ranks.id` · `rank_name`, `rank_position` denormalised · `last_visit_time` ·
+`online_status` · `deleted`
+
+### message_images — which images appear in which post
+
+| Column | Meaning |
+|---|---|
+| `message_uid`, `position` | Primary key together. Keyed on position, **not** `image_id`, because images hosted elsewhere have no ID and would all collapse into one null-keyed row. |
+| `image_id` | Joins to `image_files`. **Null for images hosted elsewhere** — imgur, githubusercontent and similar, about 2% of rows. |
+| `url` | Where the image came from, left pointing at the original host. |
+| `source` | `body_html` for images found in the post text, `images_api` for the handful attached but never mentioned in the body. |
+
+### image_files — one row per image per size
+
+`image_id` and `variant` are the primary key together, so each image has three
+rows: `original`, `large`, `medium`.
+
+`filename` · `bytes` · `content_type` · `source_url` · `gcs_uri` — the last is
+where the file actually went in the bucket.
+
+### message_labels and message_tags
+
+Both attach vocabulary to a message, but they behave differently.
+
+| | `message_labels` | `message_tags` |
+|---|---|---|
+| Set by | moderators, from a fixed list | anyone, free text |
+| Distinct values | 47 | 2,950 |
+| Key | `(message_uid, label)` — the **text is the identity**, Khoros gives labels no ID | `(message_uid, tag_id)` |
+| Appears on | thread openers only | **replies too** — 86% of tags are on replies |
+
+Because a label's identity is its text, renaming one in Khoros makes it a
+different label. Tags survive renames, since `tag_id` is stable.
+
+### boards — the four forums
+
+`id` (PK, e.g. `ideas`) · `title` · `short_title` · `description` ·
+`conversation_style` · `creation_date` · `views` (lifetime) · `position` ·
+`depth` · `hidden` · `language` · `rating` · `allowed_labels` ·
+`require_thread_root_label` · `comments_enabled` · `view_href`
+
+`conversation_style` is the one to notice: `idea` or `forum`. It is what makes
+Ideas an idea board, and therefore why kudos there are votes.
+
+### ranks — the reputation ladder, 36 rows
+
+`id` (PK) · `name` · `position` · `bold` · `color` · `rank_status` ·
+`formula_enabled`
+
+Only **14 are active**; the other 22 are stock Khoros defaults left over from
+setup, marked `rank_status = deleted`. Lower `position` means higher standing.
+`formula_enabled` separates the two kinds: ranks earned automatically by
+activity, versus staff badges granted by role. The top five are role-based,
+which makes them a clean way to tell Mozilla staff from community members.
 
 ## Collection map
 
@@ -77,7 +407,7 @@ Both are account-side and need Fivetran, not code:
 |---|---|---|---|
 | `messages` | 92,383 | ✅ | Every post: body, author, times, views, state. The core table. |
 | `boards` | 4 | ✅ | The four forums, with settings and lifetime view counts. |
-| `nodes` | 6 | ✅ | Container tree above boards, including one group hub. |
+| `nodes` | 6 | ✅ | Container tree above boards. **Not exported** — see below. |
 | `ranks` | 36 (14 active) | ✅ | The reputation ladder and staff badges. |
 | `images` | 7,204 | ✅ per message | Uploaded images, URLs at seven sizes. Bulk sweeps truncate — see below. |
 | `labels` | — | ✅ per message | Curated taxonomy (`Thunderbird`, `Mobile-Android`). Thread openers only. |
@@ -216,10 +546,20 @@ Sub-queries: `messages` (all posts) and `topics` (`... AND depth = 0`).
 Lifetime views: Discussions 388.7M, Ideas 262.7M, Firefox Labs 59.6M,
 Community 3.1K.
 
-## nodes — 20 fields
+## nodes — 20 fields, not exported
 
 Six rows — the container tree. `boards` is a **subset** of `nodes`: nodes covers
 every container type, boards only the ones holding conversations.
+
+**We deliberately don't export this.** It is `boards` plus two rows nobody
+wants: the community root, and a "Group Hub Test" with no views and no messages.
+The tree it describes is flat, because Connect has no categories. And its IDs
+don't match — a board is `board:ideas` here but `ideas` in `boards`, which is
+the form messages reference, so joining needs a prefix strip. Nothing wanted it.
+
+Documented anyway, because it is the only place the group hub and the root's
+lifetime view count appear, and because that would be worth revisiting if
+categories ever got added.
 
 ```
 Mozilla Connect          (community)   711.0M views

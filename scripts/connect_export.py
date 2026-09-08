@@ -14,37 +14,42 @@ Tables it produces:
     message_labels    the curated labels on a message
     message_tags      the free-text tags on a message
     image_files       every downloaded image file and where it ended up
-    boards / nodes    the four forums and the container tree
+    boards            the four forums, with their settings
     ranks             the reputation ladder and staff badges
 
 Run it through uv so it picks up the project's requests -- the system Python
-doesn't have it. Everything writes to DEFAULT_OUT unless you pass --out. The
-commands form a pipeline:
+doesn't have it. One command does the lot:
 
-    uv run scripts/khoros_export.py fetch-references
-    uv run scripts/khoros_export.py fetch-messages
-    uv run scripts/khoros_export.py fetch-labels
-    uv run scripts/khoros_export.py fetch-tags
-    uv run scripts/khoros_export.py fetch-images
-    uv run scripts/khoros_export.py load
+    uv run scripts/connect_export.py refresh
 
-Everything named fetch-* pulls data down from Khoros. `load` is the only one
-that pushes anything up: tables into BigQuery, and image files into the bucket
-named by GCS_BUCKET. Use --bucket to send them somewhere else, or --no-bucket
-to load BigQuery and skip the images.
+That clears the old data, fetches everything, and loads it into BigQuery and the
+GCS bucket. Expect about three hours, nearly all of it labels and tags. It
+checks your Google Cloud access first, so a stale gcloud token fails in seconds
+rather than after three hours.
 
-Every step is resumable, but resumable is not the same as incremental: a second
-run skips whatever it already has rather than looking for changes. To pick up
-new and edited posts, clear the old data first and let the pipeline redo it.
+If a step fails, everything up to it is saved. Carry on with:
 
-    uv run scripts/khoros_export.py clean          # messages and enrich
-    uv run scripts/khoros_export.py clean --images # those plus the image files
+    uv run scripts/connect_export.py refresh --resume
 
-Rough costs on a full run: the message sweep is about 95 requests and a few
-minutes. fetch-labels and fetch-tags spend a request per message that carries
-any, which the sweep counts up front so they can skip the rest -- together
-around two and a half hours. fetch-images pulls three sizes of every
-Khoros-hosted image, roughly 14,500 files and 2 GB.
+Without --resume it starts over, which would throw that progress away.
+
+The individual steps are still there for when you want to redo one part:
+
+    fetch-references   boards and ranks
+    fetch-messages     the sweep, about 95 requests
+    fetch-labels       one request per labelled message
+    fetch-tags         one request per tagged message
+    fetch-images       three sizes of each image, ~14,500 files and 2 GB
+    load               push to BigQuery, and to the bucket unless --no-bucket
+    clean              delete local data so the next run starts fresh
+
+Everything writes to DEFAULT_OUT unless you pass --out.
+
+Watch out for one thing if you run the steps by hand: each fetch step skips what
+it already has, so without a clean first the run finishes in seconds, says it
+worked, and picks up nothing new. `refresh` handles that for you. Khoros cannot
+tell us what changed since last time, so a full re-fetch is the only way to see
+new and edited posts.
 """
 
 import argparse
@@ -406,10 +411,16 @@ def read_ndjson(path):
 
 
 def cmd_fetch_references(client, args):
-    """Export the small reference tables: boards, nodes, ranks.
+    """Export the small reference tables: boards and ranks.
 
     These describe the shape of the community rather than anything that
-    happened in it, and between them they run to 46 rows.
+    happened in it, and between them they run to 40 rows.
+
+    The `nodes` collection is deliberately skipped. It is `boards` plus two rows
+    nobody wants -- the community root and an empty test group hub -- describing
+    a tree that is flat, because Connect has no categories. Its IDs don't even
+    match: a board is `board:ideas` there but `ideas` in `boards`, which is the
+    form messages reference.
     """
     out = Path(args.out) / "references"
 
@@ -420,11 +431,6 @@ def cmd_fetch_references(client, args):
             "creation_date, views, position, depth, hidden, language, rating, "
             "allowed_labels, require_thread_root_label, comments_enabled, view_href "
             "FROM boards LIMIT 500",
-        ),
-        (
-            "nodes",
-            "SELECT id, title, short_title, description, node_type, depth, position, "
-            "hidden, creation_date, views FROM nodes LIMIT 500",
         ),
         (
             "ranks",
@@ -928,12 +934,9 @@ def cmd_clean(_client, args):
     if not root.exists():
         raise SystemExit(f"{root} does not exist")
 
-    if args.everything:
-        targets = [root]
-    else:
-        targets = [root / "messages", root / "enrich"]
-        if args.images:
-            targets.append(root / "images")
+    # --images means "the expensive stuff too", so it takes the whole directory.
+    # Sparing references/ and derived/ would save seconds, not minutes.
+    targets = [root] if args.images else [root / "messages", root / "enrich"]
 
     targets = [t for t in targets if t.exists()]
     if not targets:
@@ -951,11 +954,6 @@ def cmd_clean(_client, args):
     for target in targets:
         shutil.rmtree(target)
         print(f"removed {target}")
-
-    # The manifest describes files we just deleted, so it has to go too.
-    if args.images or args.everything:
-        manifest = root / "derived" / "image_files.ndjson"
-        manifest.unlink(missing_ok=True)
 
 
 def ensure_dataset():
@@ -1049,6 +1047,51 @@ def upload_images(root, bucket):
     print(f"uploaded {len(rows)} files")
 
 
+def preflight(args, domain):
+    """Check everything the run depends on before spending hours on it.
+
+    Three things: Khoros answers, BigQuery is reachable, and the bucket exists.
+    All of them take about a second, and any of them can waste your afternoon.
+
+    `load` runs last, so a stale gcloud token would otherwise surface after
+    three hours of fetching. And a mistyped domain looks like a network failure
+    to the retry logic, which would patiently back off for four minutes before
+    giving up -- so this asks once, directly, with no retries.
+    """
+    print("checking access before the long part...")
+
+    try:
+        response = requests.get(
+            f"https://{domain}/api/2.0/search",
+            params={"q": "SELECT id FROM boards LIMIT 1"},
+            headers={"Accept": "application/json"},
+            timeout=30,
+        )
+        response.raise_for_status()
+        if response.json().get("status") != "success":
+            raise KhorosError(response.json().get("message"))
+    except (requests.RequestException, KhorosError, ValueError) as exc:
+        raise SystemExit(f"cannot reach the Khoros API at {domain}: {exc}")
+
+    result = subprocess.run(
+        ["bq", f"--project_id={BQ_PROJECT}", "ls", "--max_results=1"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        raise SystemExit(
+            f"cannot reach BigQuery in {BQ_PROJECT}. Try:\n"
+            f"  gcloud auth login\n\n"
+            f"{result.stderr.strip()[:400]}"
+        )
+
+    if args.bucket and not args.no_bucket:
+        check_bucket(args.bucket)
+
+    print("  Khoros, BigQuery and the bucket are all reachable\n")
+
+
 def check_bucket(bucket):
     """Fail early with a usable message if the bucket isn't there.
 
@@ -1116,7 +1159,7 @@ def cmd_load(_client, args):
         bq_load(table, [path] if path.exists() else [], root)
 
     # The reference tables are tiny; autodetect is fine and saves three schemas.
-    for name in ("boards", "nodes", "ranks"):
+    for name in ("boards", "ranks"):
         path = root / "references" / f"{name}.ndjson"
         if path.exists():
             subprocess.run(
@@ -1135,38 +1178,74 @@ def cmd_load(_client, args):
             print(f"{name}: loaded")
 
 
-def get_session_key(domain):
-    """Return a session key, or None to call the API anonymously.
+def cmd_refresh(client, args):
+    """Do the whole thing: clear the old data, fetch it all, load it.
 
-    Anonymous covers everything public, which is all this export needs. This
-    only matters if you add credentials to reach private boards or full user
-    profiles.
+    This is the command to use. Running the six steps by hand works, but it has
+    one nasty edge: every fetch step skips whatever it already has, so if you
+    forget to clean first, the whole run finishes in seconds, reports success,
+    and picks up nothing new. There is no warning. Starting clean is the only way
+    to see new and edited posts, because Khoros cannot tell us what changed.
+
+    Images are deliberately kept. They are named by content, the image step
+    skips anything already on disk, and re-downloading 2 GB you already have
+    wastes half an hour. New images are still picked up.
+
+    If a step fails, run again with --resume. That skips the clean, so finished
+    steps are left alone and the unfinished one carries on from its last
+    checkpoint. Without --resume you would throw that progress away.
     """
-    key = os.environ.get("KHOROS_SESSION_KEY")
-    if key:
-        return key
+    steps = [
+        ("references (boards, ranks)", cmd_fetch_references),
+        ("messages", cmd_fetch_messages),
+        ("labels", cmd_fetch_labels),
+        ("tags", cmd_fetch_tags),
+        ("images", cmd_fetch_images),
+        ("load into BigQuery and GCS", cmd_load),
+    ]
 
-    user = os.environ.get("KHOROS_USER")
-    password = os.environ.get("KHOROS_PASSWORD")
-    if not (user and password):
-        return None
+    started = time.monotonic()
+    preflight(args, os.environ.get("KHOROS_DOMAIN", "connect.mozilla.org"))
 
-    response = requests.post(
-        f"https://{domain}/restapi/vc/authentication/sessions/login",
-        params={
-            "user.login": user,
-            "user.password": password,
-            "restapi.response_format": "json",
-        },
-        timeout=30,
-    )
-    response.raise_for_status()
-    body = response.json()
+    root = Path(args.out)
+    if args.resume:
+        print("carrying on from where the last run stopped\n")
+    elif root.exists():
+        # Clear the messages and taxonomy, keep the images.
+        args.images = False
+        args.yes = True
+        cmd_clean(client, args)
+        print()
 
-    try:
-        return body["response"]["value"]["$"]
-    except KeyError, TypeError:
-        raise SystemExit(f"could not read a session key from the login response: {body}")
+    for number, (label, step) in enumerate(steps, 1):
+        minutes = (time.monotonic() - started) / 60
+        print(f"\n=== step {number} of {len(steps)}: {label}  [{minutes:.0f} min in] ===")
+        try:
+            step(client, args)
+        except KhorosError, requests.RequestException, subprocess.CalledProcessError, SystemExit:
+            minutes = (time.monotonic() - started) / 60
+            print(
+                f"\nstep {number} of {len(steps)} ({label}) failed after {minutes:.0f} min.\n"
+                f"\nYour progress is saved. To carry on without starting over:\n"
+                f"\n    uv run scripts/connect_export.py refresh --resume\n"
+                f"\nRunning refresh without --resume would clear the finished steps"
+                f"\nand fetch everything again.",
+                file=sys.stderr,
+            )
+            raise SystemExit(1)
+
+    print(f"\nrefresh finished in {(time.monotonic() - started) / 60:.0f} min")
+
+
+def get_session_key():
+    """A session key from the environment, or None to call the API anonymously.
+
+    Anonymous covers everything public on Connect, which is all this export
+    needs. A key only buys private boards and full user profiles, and we have
+    never had one -- so if you set KHOROS_SESSION_KEY, expect to find out
+    whether it works.
+    """
+    return os.environ.get("KHOROS_SESSION_KEY") or None
 
 
 def main():
@@ -1186,7 +1265,34 @@ def main():
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    subparsers.add_parser("fetch-references", parents=[common], help="boards, nodes and ranks")
+    # First so it shows at the top of --help: it is the one to use.
+    refresh = subparsers.add_parser(
+        "refresh", parents=[common], help="THE USUAL ONE: clean, fetch everything, load"
+    )
+    refresh.add_argument(
+        "--resume",
+        action="store_true",
+        help="carry on after a failure instead of starting over",
+    )
+    refresh.add_argument(
+        "--board",
+        action="append",
+        help=f"board slug, repeatable (default: {', '.join(DEFAULT_BOARDS)})",
+    )
+    refresh.add_argument(
+        "--workers",
+        type=int,
+        default=DOWNLOAD_WORKERS,
+        help=f"parallel image downloads (default: {DOWNLOAD_WORKERS})",
+    )
+    refresh.add_argument(
+        "--bucket",
+        default=GCS_BUCKET,
+        help=f"gs://bucket/prefix for the image files (default: {GCS_BUCKET})",
+    )
+    refresh.add_argument("--no-bucket", action="store_true", help="skip uploading the image files")
+
+    subparsers.add_parser("fetch-references", parents=[common], help="boards and ranks")
 
     messages = subparsers.add_parser(
         "fetch-messages", parents=[common], help="sweep every board for messages"
@@ -1203,7 +1309,12 @@ def main():
     images = subparsers.add_parser(
         "fetch-images", parents=[common], help="download the image files"
     )
-    images.add_argument("--workers", type=int, default=DOWNLOAD_WORKERS)
+    images.add_argument(
+        "--workers",
+        type=int,
+        default=DOWNLOAD_WORKERS,
+        help=f"parallel image downloads (default: {DOWNLOAD_WORKERS})",
+    )
 
     load = subparsers.add_parser(
         "load", parents=[common], help="upload to BigQuery and, with --bucket, to GCS"
@@ -1223,10 +1334,9 @@ def main():
         "clean", parents=[common], help="delete parts of the export so they refetch"
     )
     clean.add_argument(
-        "--images", action="store_true", help="also delete the downloaded image files"
-    )
-    clean.add_argument(
-        "--everything", action="store_true", help="delete the whole output directory"
+        "--images",
+        action="store_true",
+        help="also delete the 2 GB of downloaded images (half an hour to refetch)",
     )
     clean.add_argument("--yes", action="store_true", help="skip the confirmation prompt")
 
@@ -1236,6 +1346,7 @@ def main():
     domain = os.environ.get("KHOROS_DOMAIN", "connect.mozilla.org")
 
     handlers = {
+        "refresh": cmd_refresh,
         "fetch-references": cmd_fetch_references,
         "fetch-messages": cmd_fetch_messages,
         "fetch-labels": cmd_fetch_labels,
@@ -1246,7 +1357,7 @@ def main():
     }
     # `load` only talks to Google and `clean` only touches local files.
     offline = {"load", "clean"}
-    client = None if args.command in offline else KhorosClient(domain, get_session_key(domain))
+    client = None if args.command in offline else KhorosClient(domain, get_session_key())
 
     handlers[args.command](client, args)
 
