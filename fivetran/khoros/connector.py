@@ -1,5 +1,19 @@
 """Fivetran connector for connect.mozilla.org (Khoros Communities).
 
+PAUSED, AND NEVER DEPLOYED. We run scripts/connect_export.py by hand instead.
+This works -- every table was checked row for row against the script -- but it
+was parked for two reasons:
+
+  * It needs two things enabled on the Fivetran account that we don't control:
+    unstructured file replication, and a GCS bucket set on the BigQuery
+    destination that other connections share.
+  * Khoros cannot answer "what changed since Tuesday", so a scheduled sync would
+    re-sweep everything anyway. That removed most of the reason to schedule it.
+
+Keep it if the account side ever gets sorted. Otherwise the script does the same
+job, and deletions are cleaner there: `bq load --replace` rewrites each table,
+so a deleted post simply vanishes rather than lingering with a flag.
+
 Syncs the community's public content: every post with its body HTML, the people
 who wrote them, the images they contain, and the reference tables describing the
 forums themselves.
@@ -8,7 +22,7 @@ No credentials needed -- Khoros serves all public content to anonymous callers.
 Set session_key in the configuration only to reach private boards.
 
 API background and the traps that cost us the most time are in
-docs/mozilla-connect.md. The standalone version is scripts/khoros_export.py.
+docs/mozilla-connect.md. The standalone version is scripts/connect_export.py.
 
 Run locally with:
 
