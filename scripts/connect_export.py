@@ -72,9 +72,9 @@ import requests
 BQ_PROJECT = "moz-fx-sumo-prod"
 BQ_DATASET = "mozilla_connect_content"
 
-# Where the image files go. US-WEST1 like the other SUMO buckets, uniform
-# access, public access prevention enforced. `load` uploads here by default;
-# override with --bucket, or skip the upload entirely with --no-bucket.
+# Where the image files go. US multi-region, uniform access, public access
+# prevention enforced. `load` uploads here by default; override with --bucket,
+# or skip the upload entirely with --no-bucket.
 GCS_BUCKET = "gs://sumo-prod-prod-connect-images"
 
 # An absolute path, so the output lands in the same place wherever you run from.
@@ -593,8 +593,9 @@ def fetch_per_message(client, root, count_field, collection, build_row, out_name
 
     The sweep counted labels, tags and images on every message, so we can skip
     the ones with none -- usually the overwhelming majority. Drive off those
-    counts rather than off is_topic: labels only appear on thread openers, but
-    replies carry tags of their own, and filtering to topics silently drops them.
+    counts rather than off is_topic. Labels and tags sit mostly on thread
+    openers, but roughly a tenth of each is on a reply, so filtering to topics
+    silently drops them.
 
     Results are saved every `batch` messages alongside the list of messages
     already done, so an interrupted run resumes instead of starting over. These

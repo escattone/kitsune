@@ -86,14 +86,14 @@ Two reasons, and the second is the one that mattered.
    to test, which is how we verified the image path works, but production needs
    it switched on properly.
 2. **A GCS bucket set on the BigQuery destination**, in the same location as the
-   dataset. That destination is shared with other connections, including the one
-   feeding `mozilla_connect`, so it isn't ours to change.
+   dataset. That destination is shared with other connections, so it isn't ours
+   to change.
    `gs://sumo-prod-prod-connect-images` was moved from US-WEST1 to US
    multi-region to satisfy the location rule — the dataset is US, and a
    single-region bucket would not have qualified.
 
 **Scheduling buys less than it looks.** Khoros cannot answer "what changed since
-Tuesday", so every sync re-sweeps all 93,000 messages regardless. A scheduled
+Tuesday", so every sync re-sweeps all 94,000 messages regardless. A scheduled
 connector would spend three hours doing that on a timer instead of when someone
 wants it, which is most of the appeal gone.
 
@@ -133,6 +133,9 @@ than assuming either layout.
 
 Eight tables in `moz-fx-sumo-prod.mozilla_connect_content`, plus the image files
 in `gs://sumo-prod-prod-connect-images`.
+
+Row counts on this page are from 2026-09-24, with content through 2026-09-18.
+They grow with every run, so treat them as scale, not as a checksum.
 
 ```mermaid
 erDiagram
@@ -265,7 +268,7 @@ describes something a message points at.
 Every column is listed above with the type BigQuery gives it. The sections below
 say what each one means.
 
-### messages — one row per post, 92,385 of them
+### messages — one row per post, 94,439 of them
 
 **Where it sits in the thread**
 
@@ -274,15 +277,15 @@ say what each one means.
 | `message_uid` | The post's own ID. Primary key. |
 | `conversation_uid` | The thread's ID, which is the opening post's `message_uid`. |
 | `parent_message_uid` | The post being replied to. Null on thread openers. |
-| `topic_message_uid` | **Always identical to `conversation_uid`** — 0 differences across all 92,385 rows. Kept only because Khoros returns both. |
+| `topic_message_uid` | **Always identical to `conversation_uid`** — 0 differences across all 94,439 rows. Kept only because Khoros returns both. |
 | `depth` | 0 for a thread opener, higher for replies. Null on ~782 rows (see the count discrepancy above). |
 | `is_topic` | True for thread openers. Equals `depth = 0` in every row. |
 | `board_slug` | Joins to `boards.id`. |
 | `message_type` | `forum_topic_message`, `idea_topic_message`, `forum_reply_message`, and so on. |
 | `is_image_comment` | Always null. Kept as a signal: if it ever fills in, those 782 unreachable messages became reachable. |
 
-Threading is genuinely nested, not flat: 62,060 replies point at the thread
-root, but **11,371 point at another reply**. So to rebuild a conversation, follow
+Threading is genuinely nested, not flat: 63,423 replies point at the thread
+root, but **11,587 point at another reply**. So to rebuild a conversation, follow
 `parent_message_uid`, not `conversation_uid`.
 
 **What was written**
@@ -292,7 +295,7 @@ root, but **11,371 point at another reply**. So to rebuild a conversation, follo
 | `subject` | The post title. |
 | `body_html` | The post itself, as HTML. This is the thing the whole export exists for. |
 | `body_chars` | Length of `body_html`. |
-| `search_snippet` | A plain-text extract Khoros builds. Not simply the first N characters — 17,049 rows are not a prefix of the body — so it is useful if you want text without parsing HTML. |
+| `search_snippet` | A plain-text extract Khoros builds. Not simply the first N characters — on a third of rows it is not a prefix of the body text at all — so it is useful if you want text without parsing HTML. |
 | `teaser` | Always empty on Connect. |
 | `language` | Always `EN`. |
 | `href`, `view_href` | The API path and the real public URL of the post. |
@@ -338,7 +341,7 @@ Khoros silently truncates at 25 rows.
 because we only see public content. Kept so that a change in Connect's settings
 would show up rather than being invisible. `is_solution` and `read_only` do vary.
 
-### message_authors — 39,659 people who have posted
+### message_authors — 40,491 people who have posted
 
 Not called `users` on purpose. Khoros's `users` collection returns zero rows to
 anonymous callers, so this is built up from post authors as the export sweeps.
@@ -373,9 +376,9 @@ Both attach vocabulary to a message, but they behave differently.
 | | `message_labels` | `message_tags` |
 |---|---|---|
 | Set by | moderators, from a fixed list | anyone, free text |
-| Distinct values | 47 | 2,950 |
+| Distinct values | 47 | 3,034 |
 | Key | `(message_uid, label)` — the **text is the identity**, Khoros gives labels no ID | `(message_uid, tag_id)` |
-| Appears on | thread openers only | **replies too** — 86% of tags are on replies |
+| Appears on | mostly thread openers — but 1,334 of 15,138 sit on replies | mostly thread openers — but 1,290 of 11,271 sit on replies |
 
 Because a label's identity is its text, renaming one in Khoros makes it a
 different label. Tags survive renames, since `tag_id` is stable.
@@ -410,7 +413,7 @@ which makes them a clean way to tell Mozilla staff from community members.
 | `nodes` | 6 | ✅ | Container tree above boards. **Not exported** — see below. |
 | `ranks` | 36 (14 active) | ✅ | The reputation ladder and staff badges. |
 | `images` | 7,204 | ✅ per message | Uploaded images, URLs at seven sizes. Bulk sweeps truncate — see below. |
-| `labels` | — | ✅ per message | Curated taxonomy (`Thunderbird`, `Mobile-Android`). Thread openers only. |
+| `labels` | — | ✅ per message | Curated taxonomy (`Thunderbird`, `Mobile-Android`). Mostly thread openers, not exclusively. |
 | `tags` | — | ✅ per message | Free-text tags (`android`). **Replies carry these too.** |
 | `kudos` | — | ✅ per message | Individual votes: who, when, weight. |
 | `revisions` | — | ✅ per message | Edit metadata only — no historical body text. |
@@ -451,7 +454,7 @@ matter. Don't treat `SELECT *` as the field list.
 
 | Field | What it is |
 |---|---|
-| `id` | Message ID. Matches `message_uid` in the BigQuery event tables. |
+| `id` | Message ID. Becomes `message_uid` in the export. |
 | `type` | Always `message` |
 | `message_type` | `forum_topic_message`, `forum_reply_message`, `idea_topic_message`, … |
 | `depth` | 0 = opened the thread, >0 = a reply. Null on 782 messages (see above). |
@@ -527,9 +530,74 @@ spending a request.
  "name": "New idea", "completed": false}
 ```
 
-In 400 recent idea topics: 399 `New idea`, 1 `Delivered`. The interesting values
-live on older ideas. Since Ideas is the largest board, this is the field that
-answers "which ideas shipped".
+Since Ideas is the largest board, this is the field that answers "which ideas
+shipped". Across all 10,244 idea topics:
+
+| `status_key` | `status_name` | ideas |
+| --- | --- | ---: |
+| `new` | New idea | 9,795 |
+| `delivered` | Delivered | 250 |
+| `accepted` | In development | 63 |
+| `trending-idea` | Trending idea | 59 |
+| `declined` | Closed | 45 |
+| `investigating` | In review | 12 |
+| `exploring-more` | Exploring more | 9 |
+| `not-right-now` | Not right now | 9 |
+| `needs_info` | Needs more | 2 |
+
+`status_completed` is true for `delivered` and nothing else. Note that the key
+and the name often disagree — `accepted` displays as "In development",
+`declined` as "Closed".
+
+### When the status changed
+
+The status object carries no timestamp. It is the current state and nothing
+more. Tags have no timestamp either. So neither the export nor the API can tell
+you directly when an idea was delivered.
+
+The date is still recoverable, because **Khoros posts every status change as a
+reply in the thread**:
+
+> Re: Firefox ad-blocking in iOS Firefox - Status changed to: Delivered
+
+That reply is an ordinary row in `messages`, written by the moderator who made
+the change, and its `post_time` is the moment the status changed. Pull the new
+status out of the subject and you have a full history:
+
+```sql
+SELECT
+  topic_message_uid AS idea_uid,
+  REGEXP_EXTRACT(subject, r'Status changed to:\s*(.+)$') AS new_status,
+  post_time AS changed_at,
+  author_login AS changed_by
+FROM `moz-fx-sumo-prod.mozilla_connect_content.messages`
+WHERE board_slug = 'ideas' AND subject LIKE '%Status changed to:%'
+```
+
+10,738 of these posts exist, going back to March 2022, covering all nine
+statuses. Coverage of delivery dates is complete: every one of the 250 currently
+delivered ideas has a matching post. 254 ideas have been marked delivered at
+some point — four were marked twice, and four later moved to another status, so
+take `MAX(post_time)` unless you care about the churn.
+
+Joining that back to the idea gives you time-to-delivery:
+
+```sql
+SELECT i.subject, i.post_time, c.changed_at,
+       DATE_DIFF(DATE(c.changed_at), DATE(i.post_time), DAY) AS days
+FROM `moz-fx-sumo-prod.mozilla_connect_content.messages` i
+JOIN (/* the query above */) c ON c.idea_uid = i.message_uid
+WHERE i.is_topic AND c.new_status = 'Delivered'
+```
+
+**These posts inflate reply counts.** They are ordinary replies, so they land in
+`reply_count`, in `messages`, and against a real author — one moderator account
+wrote 10,456 of them. Filter them out of any analysis of community discussion or
+of who posts the most.
+
+One red herring: a handful of ideas carry tags like `tbdelivered2024`. That is a
+Thunderbird team convention on 19 posts, not the delivery mechanism. Use
+`status_key`.
 
 ## boards — 33 fields
 
@@ -699,26 +767,45 @@ free inline via `kudos.sum(weight)`, so fetch these rows only if you need to
 know *who* voted. Note `kudos.count(*)` is **not** valid — only
 `kudos.sum(weight)`. Every weight seen so far is 1, so the sum doubles as a count.
 
-**Replies carry the overwhelming majority.** In one board, 3,898 replies had
-kudos against 38 topics — 98.6% of the 31,047 total. Anything that assumes kudos
-live on thread openers will miss nearly all of them.
+**Where kudos sit depends entirely on the board**, so don't assume either way.
+Of the 217,932 kudos across the export:
+
+| Board | On topics | On replies | Share on replies |
+|---|---:|---:|---:|
+| Ideas | 119,744 | 5,779 | 4.6% |
+| Discussions | 13,259 | 48,074 | 78.4% |
+| Firefox Labs | 450 | 30,626 | 98.6% |
+| **All** | **133,453** | **84,479** | **38.8%** |
+
+On Ideas, kudoing the topic *is* the vote, so almost everything lands on the
+thread opener. On the forum boards it inverts. Drive off `kudos.sum(weight)`
+per message rather than inferring anything from `depth`.
 
 **The per-message query is complete and pages properly**, unlike `images`. A
 reply with 1,042 kudos returned 1000 rows plus a cursor, then 42 more —
 1,042 exactly, matching `kudos.sum(weight)`.
 
-Fetching kudos detail for the whole community is expensive. Share of messages
-carrying at least one kudo, by board:
+### What a full kudos export would cost
 
-| Board | Sample | With kudos |
-|---|---|---|
-| Firefox Labs | whole board, 4,944 | 80% |
-| Discussions | newest 1,000 | 38% |
-| Ideas | newest 1,000 | 23% |
+Not exported today. `messages.kudos_weight` gives the total per message, so the
+size of the job is known exactly rather than estimated:
 
-The Discussions and Ideas figures are drawn from the newest posts and so
-understate the true rate, since kudos accumulate over time. Expect somewhere
-between 30,000 and 75,000 requests for a full kudos export — a few hours.
+| | |
+|---|---:|
+| Messages with at least one kudo | 30,536 (32.3%) |
+| Requests, including paging | 30,553 |
+| Rows produced | 217,932 |
+| Runtime at the script's 0.5s pause | ~4.5 h, realistically 5–6 |
+
+That roughly doubles a full refresh, so it belongs in its own step rather than
+in `refresh` by default. Share of messages carrying a kudo, by board: Labs 79%,
+Discussions 41%, Ideas 23%, Community 0%.
+
+⚠️ **`fetch_per_message()` would truncate this silently.** It issues one
+`LIMIT 1000` query and takes the items, never following the cursor. That is safe
+for labels and tags, but **12 messages have more than 1000 kudos** (the busiest
+4,606). Teach it to loop on the existing `page(liql, cursor)` helper before
+adding a kudos step, not after.
 
 ## revisions — 4 fields
 
@@ -753,8 +840,9 @@ Treat `Retry-After` as a floor to raise the wait, never to lower it:
 wait = min(max(float(retry_after), 2 ** attempt), 300)
 ```
 
-**Image downloads are governed separately.** 14,586 files pulled at six
-concurrent workers, roughly 12 requests a second, produced zero 429s. Those
+**Image downloads are governed separately.** A full sweep of the image set —
+about 14,500 files at the time — pulled at six concurrent workers, roughly 12
+requests a second, produced zero 429s. Those
 come through Cloudflare (`cf-cache-status` is present on the response) while the
 API does not, so CDN throughput says nothing about what the API will tolerate.
 
@@ -815,36 +903,15 @@ Full user profiles need an API app with admin rights
    `SELECT * FROM tags WHERE messages.id = '37391'` with 25 rows and a cursor,
    and nothing about the response says it was truncated. Always pass a LIMIT.
    Page further with `CURSOR '<next_cursor>'`; `OFFSET` breaks past ~2000 rows.
-9. **Only labels are thread-opener-only. Tags and kudos are not.** In one board,
-   86% of tags and 98.6% of kudos sat on replies. Drive off `tags.count(*)`,
-   `labels.count(*)` and `kudos.sum(weight)` per message rather than inferring
-   anything from `depth`.
+9. **Nothing is thread-opener-only — and the split varies wildly by board.**
+   Replies carry 11% of tags, 9% of labels, and anywhere from 5% of kudos on
+   Ideas to 99% on Labs. Drive off `tags.count(*)`, `labels.count(*)` and
+   `kudos.sum(weight)` per message rather than inferring anything from `depth`.
+   Figures sampled from one board will mislead you; these are whole-corpus.
 10. **Slugs are case-sensitive** — `Labs`, not `labs`.
 11. **Timestamps in LiQL need a colon in the offset**:
     `2024-08-07T00:00:00.000+00:00`. `strftime('%z')` gives `+0000` and is rejected.
-
-## How this compares to the BigQuery event tables
-
-The API is better for content and current state. The event log keeps things the
-API never had.
-
-| | API | BigQuery event log |
-|---|---|---|
-| Post text | ✅ | ❌ |
-| Reply threading (`parent.id`) | ✅ | ❌ |
-| Idea workflow status | ✅ current | ✅ as change events |
-| Views | ✅ current total | ✅ every individual event |
-| Kudos | ✅ total + who | ✅ as events, 2 years |
-| History | ✅ all of it | ⚠️ 2024-08-07 onward only |
-| Deleted threads | ❌ gone | ✅ still recorded |
-| Boards | ❌ only 4 public | ✅ all 19, incl. moderation and media |
-| Visitor / visit IDs | ❌ | ✅ |
-| Geography, device | ❌ | ✅ |
-| Referrer host / URL | ❌ | ✅ |
-| Search terms and results | ❌ | ✅ |
-
-Neither is a superset. The API returns 18,953 topics; the event log shows 26,061
-distinct threads across the same four boards — a gap of ~7,400 threads that have
-since been deleted, merged or made private. The event log also covers 15 boards
-the API won't show at all (Public Media at 9,162 threads, Private Media at 2,941,
-Abuse Reports, Filter Notifications, Moderation Archive, and the rest).
+12. **Idea status changes are replies, not metadata.** Khoros posts
+    "Status changed to: X" into the thread, so status history is recoverable —
+    but those posts also inflate reply counts and author totals. See
+    [Idea status](#idea-status).
