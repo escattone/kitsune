@@ -85,6 +85,7 @@ nav:
         - browser_permissions.md
         - zendesk.md
         - mozilla-connect.md
+        - connect-sumo-migration.md
         - seo.md
         - notes.md
         - switching_devices.md
