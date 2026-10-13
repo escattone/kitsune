@@ -29,11 +29,22 @@ uv run scripts/connect_export.py refresh
 ```
 
 That clears the old data, fetches everything, and loads it into BigQuery and the
-GCS bucket. **About three hours**, nearly all of it labels and tags — those need
-one request per message and there are roughly 13,000 of them.
+GCS bucket. **Ten to eleven hours**, of which six or seven is kudos — one
+request per message that has any, and 26,589 messages do. Labels and tags add
+another 13,500 requests between them.
+
+To get email and `sso_id` as well, sign in first:
+
+```
+export KHOROS_USER=connectx
+export KHOROS_PASSWORD=$(security find-generic-password -s khoros-connectx -w)
+```
+
+Without those, `refresh` says so and carries on — every other step works
+anonymously, you just get a `users` table with no identity columns.
 
 It checks Khoros, BigQuery and the bucket first, so a stale `gcloud` token or a
-typo fails in seconds rather than after three hours.
+typo fails in seconds rather than ten hours in.
 
 If a step fails, everything up to it is saved. Carry on with:
 
@@ -131,11 +142,19 @@ than assuming either layout.
 
 ## What lands in BigQuery
 
-Eight tables in `moz-fx-sumo-prod.mozilla_connect_content`, plus the image files
+Nine tables in `moz-fx-sumo-prod.mozilla_connect_content`, plus the image files
 in `gs://sumo-prod-prod-connect-images`.
 
-Row counts on this page are from 2026-09-24, with content through 2026-09-18.
-They grow with every run, so treat them as scale, not as a checksum.
+Row counts on this page are from 2026-10-12. They grow with every run, so treat
+them as scale, not as a checksum. `users` and `message_kudos` are new and were
+not in the last completed run, so they will be empty until the next one.
+
+!!! warning "Two files hold real email addresses"
+
+    `derived/connect_users.ndjson` and `derived/users.ndjson` are written
+    owner-only (`0600`). The permissions are set as the file is created, not
+    afterwards, so there is no moment when another account could read them.
+    Everything else is public forum content and keeps the normal `0644`.
 
 ```mermaid
 erDiagram
@@ -188,7 +207,7 @@ erDiagram
         integer tag_count
         integer image_count
     }
-    message_authors {
+    users {
         integer user_uid PK
         string login
         string view_href
@@ -198,6 +217,20 @@ erDiagram
         timestamp last_visit_time
         string online_status
         boolean deleted
+        boolean posted
+        boolean voted
+        string email
+        string sso_id
+        string sso_connection
+        string sso_identifier
+    }
+    message_kudos {
+        integer message_uid FK
+        integer kudo_id
+        integer user_uid FK
+        string user_login
+        timestamp kudo_time
+        integer weight
     }
     message_images {
         integer message_uid PK, FK
@@ -256,10 +289,12 @@ erDiagram
     messages ||--o{ message_images : "shows"
     messages ||--o{ message_labels : "tagged with"
     messages ||--o{ message_tags : "tagged with"
-    messages }o--|| message_authors : "written by"
+    messages ||--o{ message_kudos : "voted on"
+    messages }o--|| users : "written by"
     messages }o--|| boards : "posted in"
     message_images }o--o| image_files : "3 sizes of"
-    message_authors }o--|| ranks : "ranked"
+    message_kudos }o--|| users : "cast by"
+    users }o--|| ranks : "ranked"
 ```
 
 `messages` is the centre of it. Everything else either describes a message, or
@@ -339,7 +374,7 @@ individual post.
 
 **Who**
 
-`author_uid` joins to `message_authors.user_uid`. `author_login` is denormalised
+`author_uid` joins to `users.user_uid`. `author_login` is denormalised
 onto the row so simple queries need no join. `revision_id`, `revision_num` and
 `last_edit_author_login` describe the most recent edit.
 
@@ -374,16 +409,66 @@ Khoros silently truncates at 25 rows.
 because we only see public content. Kept so that a change in Connect's settings
 would show up rather than being invisible. `is_solution` and `read_only` do vary.
 
-### message_authors — 40,491 people who have posted
+### users — every registered account, 117,105 of them
 
-Not called `users` on purpose. Khoros's `users` collection returns zero rows to
-anonymous callers, so this is built up from post authors as the export sweeps.
-It covers people who have **posted**, not everyone registered, and it has no
-registration dates or lifetime kudos totals.
+Built from three sources, which is why so many columns can be null.
 
-`user_uid` (PK) · `login` · `view_href` (profile URL) · `rank_id` joins to
-`ranks.id` · `rank_name`, `rank_position` denormalised · `last_visit_time` ·
-`online_status` · `deleted`
+| Source | Supplies |
+|---|---|
+| `fetch-users` sweep | The full roster: `login`, `email`, `sso_id` and the two columns split out of it |
+| The message sweep | `view_href`, `rank_*`, `last_visit_time`, `online_status`, `deleted`, and `posted` |
+| `fetch-kudos` | `voted` |
+
+Only the sweep sees everyone. The other two only know about people who did
+something, so **an account that registered and never posted or voted has nulls
+for rank, last visit and online status.** That is missing data, not a false
+value.
+
+`posted` and `voted` say what each person actually did. Roughly two thirds of
+the roster did neither.
+
+**`voted` is null, not false, when `fetch-kudos` has not run** — otherwise an
+incomplete export would read as "nobody votes". Same reasoning for `email` and
+`sso_id` when the sweep has not run.
+
+#### The identity columns
+
+`sso_id` is an Auth0 identifier, and `sso_connection` / `sso_identifier` are
+just it split on the last pipe, so nobody has to redo the string surgery:
+
+```
+oauth2|firefoxaccounts|4eda450cac5d4082994c46043e8f1a9d
+└──── sso_connection ────┘ └──────── sso_identifier ────────┘
+```
+
+**When `sso_connection` is `oauth2|firefoxaccounts`, `sso_identifier` is the FxA
+UID** — the exact value in SUMO's `Profile.fxa_uid`. That is the clean join for
+a migration. For every other connection there is no FxA UID and email is the
+only link. See
+[Migrating Mozilla Connect into SUMO](connect-sumo-migration.md) for the
+measured breakdown.
+
+These columns need an account to populate; see
+[users — the full roster needs an account](#users-the-full-roster-needs-an-account).
+
+### message_kudos — one row per vote
+
+| Column | Meaning |
+|---|---|
+| `message_uid` | The message voted on. Kudos attach to a **single message**, never to a thread. |
+| `kudo_id` | Khoros's own id for the vote. |
+| `user_uid`, `user_login` | Who cast it. Joins to `users.user_uid`. |
+| `kudo_time` | When. The only timestamp Connect gives for an action on a post — tags and statuses have none. |
+| `weight` | Always 1. |
+
+One vote per person per message, and it is enforced: on the busiest message,
+4,606 kudos came from 4,606 distinct accounts with no duplicates. So
+`SUM(weight)` is a headcount, and `messages.kudos_weight` agrees with it.
+
+**Anonymous cannot vote.** `SELECT * FROM kudos WHERE user.id = '-1'` returns
+nothing community-wide, so unlike posts — where 1,562 in-scope messages belong
+to the `Anonymous` placeholder — every vote has a real account behind it.
+Khoros appears to delete a departing member's votes rather than reassign them.
 
 ### message_images — which images appear in which post
 
@@ -450,7 +535,7 @@ which makes them a clean way to tell Mozilla staff from community members.
 | `tags` | — | ✅ per message | Free-text tags (`android`). **Replies carry these too.** |
 | `kudos` | — | ✅ per message | Individual votes: who, when, weight. |
 | `revisions` | — | ✅ per message | Edit metadata only — no historical body text. |
-| `users` | — | ❌ **0 rows** | Locked to anonymous callers. Use `author.*` instead. |
+| `users` | 117,105 | ❌ **0 rows** | Anonymous gets an empty list, not an error. Signed in it sweeps by cursor and includes `email` and `sso_id`. |
 | `categories` | 0 | ✅ | Empty on this instance. |
 | `custom_tags` | — | ✅ | Readable, zero rows in every sample. |
 | `attachments` | — | ✅ | Readable, zero rows in every sample. |
@@ -818,27 +903,34 @@ per message rather than inferring anything from `depth`.
 reply with 1,042 kudos returned 1000 rows plus a cursor, then 42 more —
 1,042 exactly, matching `kudos.sum(weight)`.
 
-### What a full kudos export would cost
+### What the kudos export costs
 
-Not exported today. `messages.kudos_weight` gives the total per message, so the
-size of the job is known exactly rather than estimated:
+`fetch-kudos` is the slowest step by a wide margin. Against the default boards:
 
 | | |
 |---|---:|
-| Messages with at least one kudo | 30,536 (32.3%) |
-| Requests, including paging | 30,553 |
-| Rows produced | 217,932 |
-| Runtime at the script's 0.5s pause | ~4.5 h, realistically 5–6 |
+| Messages with at least one kudo | 26,589 |
+| Requests, including paging | 26,605 |
+| Rows produced | 186,856 |
+| Runtime | **6 to 7 hours** |
 
-That roughly doubles a full refresh, so it belongs in its own step rather than
-in `refresh` by default. Share of messages carrying a kudo, by board: Labs 79%,
-Discussions 41%, Ideas 23%, Community 0%.
+That is 0.5s of deliberate pause per request, about 0.23s of real latency, and
+the 429 retries described under [Rate limiting](#rate-limiting) — roughly 0.9s
+per request all in. It takes a full refresh from about three hours to ten or
+eleven.
 
-⚠️ **`fetch_per_message()` would truncate this silently.** It issues one
-`LIMIT 1000` query and takes the items, never following the cursor. That is safe
-for labels and tags, but **12 messages have more than 1000 kudos** (the busiest
-4,606). Teach it to loop on the existing `page(liql, cursor)` helper before
-adding a kudos step, not after.
+Share of messages carrying a kudo, by board: Labs 79%, Discussions 41%,
+Ideas 23%, Community 0%.
+
+Two things that caught us out building it, both now handled:
+
+- **`kudos` filters on `message.id`, singular.** Labels, tags and images use
+  `messages.id`. The wrong one fails every request with `Invalid query syntax`,
+  which is why `fetch_per_message()` takes a `filter_column`.
+- **`fetch_per_message()` used to ignore cursors.** Safe for labels and tags,
+  where nothing reaches 1000, but **11 in-scope messages have more than 1000
+  kudos** and the busiest has 4,606 — those came back silently truncated to
+  1000. It now loops on `page(liql, cursor)`.
 
 ## revisions — 4 fields
 
@@ -879,12 +971,52 @@ requests a second, produced zero 429s. Those
 come through Cloudflare (`cf-cache-status` is present on the response) while the
 API does not, so CDN throughput says nothing about what the API will tolerate.
 
-## users — blocked, but reachable through `author.*`
+## users — the full roster needs an account
 
-`SELECT * FROM users` returns HTTP 200 with **zero rows**, even for a targeted
-`WHERE id = '135643'`. Anonymous callers cannot read the collection.
+**Anonymous callers get HTTP 200 with zero rows** and `"status": "success"` —
+never an error, even for a targeted `WHERE id = '135643'`. So an unauthenticated
+sweep looks exactly like a community with no members. Never read absence of an
+error as success here; test against an account you know exists.
 
-Tested across 276 distinct authors from 300 recent topics:
+Signed in, the collection opens up completely:
+
+| | |
+|---|---|
+| `count(*)` | Allowed — **117,105** accounts |
+| Unfiltered read | Works, and pages by cursor, **newest id first** |
+| Full sweep | ~117 requests, about two minutes |
+| `email`, `sso_id` | Present on every row |
+
+That is what `fetch-users` does. A service account with the
+`allow_restapi_call_read` permission is enough — admin rights are not needed.
+
+### Signing in
+
+The v2 API has no sign-in endpoint. Session keys come from the older v1 REST
+API:
+
+```
+POST /restapi/vc/authentication/sessions/login
+     ?restapi.response_format=json
+     user.login=<login>  user.password=<password>
+```
+
+The key arrives at `response.value.$` and goes on v2 calls as the
+`li-api-session-key` header. Set `KHOROS_USER` and `KHOROS_PASSWORD` and the
+script does this itself, or set `KHOROS_SESSION_KEY` to supply one directly.
+
+Two undocumented limits, both of which produce confusing errors:
+
+- **The login must be under 15 characters.**
+- **The password must be 20 or fewer.** The API says "must be shorter than 20"
+  but means 21 is the first length it rejects; 20 is accepted. Special
+  characters do not count against it — the server measures the decoded value.
+
+### Reaching people without an account
+
+Everything below still applies when running anonymously, which is how the
+export worked before `fetch-users` existed. Tested across 276 distinct authors
+from 300 recent topics:
 
 | Available | Coverage |
 |---|---|
@@ -901,8 +1033,9 @@ Tested across 276 distinct authors from 300 recent topics:
 | `author.solutions_authored.count(*)` | ✅ |
 | `author.albums.count(*)` | ✅ |
 
-**Withheld — 0/276, so blocked rather than coincidence:** `email`,
-`first_name`, `last_name`, `biography`, `location`, `sso_id`.
+**Withheld from anonymous callers — 0/276, so blocked rather than
+coincidence:** `email`, `first_name`, `last_name`, `biography`, `location`,
+`sso_id`. A signed-in sweep gets `email` and `sso_id`.
 
 **Rejected outright:** `registration_time`, `roles`, `nickname`,
 `replies.count(*)`, `kudos_received.count(*)`, `kudos_given.count(*)`,
@@ -914,9 +1047,6 @@ public boards.
 
 Aggregates need the function form: `author.solutions_authored.count(*)` works,
 `author.solutions_authored.count` does not.
-
-Full user profiles need an API app with admin rights
-(Community Admin → System → API Apps, or profile icon → Dev Tools → API Apps).
 
 ## Quirks worth remembering
 

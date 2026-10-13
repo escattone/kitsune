@@ -9,10 +9,11 @@ callers, post bodies included.
 
 Tables it produces:
     messages          one row per post, 53 fields, including body HTML
-    message_authors   everyone who posted, built up during the sweep
+    users             everyone who posted or voted, with flags saying which
     message_images    images in each post, from the body HTML and the API
     message_labels    the curated labels on a message
     message_tags      the free-text tags on a message
+    message_kudos     one row per kudo: who gave it, on what, and when
     image_files       every downloaded image file and where it ended up
     boards            one row per exported board, with its settings
     ranks             the reputation ladder and staff badges
@@ -23,9 +24,9 @@ doesn't have it. One command does the lot:
     uv run scripts/connect_export.py refresh
 
 That clears the old data, fetches everything, and loads it into BigQuery and the
-GCS bucket. Expect about three hours, nearly all of it labels and tags. It
-checks your Google Cloud access first, so a stale gcloud token fails in seconds
-rather than after three hours.
+GCS bucket. Expect seven to eight hours, nearly all of it kudos, labels and
+tags. It checks your Google Cloud access first, so a stale gcloud token fails in
+seconds rather than after eight hours.
 
 If a step fails, everything up to it is saved. Carry on with:
 
@@ -39,6 +40,8 @@ The individual steps are still there for when you want to redo one part:
     fetch-messages     the sweep, about 95 requests
     fetch-labels       one request per labelled message
     fetch-tags         one request per tagged message
+    fetch-kudos        one request per message with kudos, ~26,600 of them
+    fetch-users        email and sso_id, ~117 requests, needs an account
     fetch-images       three sizes of each image, ~14,500 files and 2 GB
     load               push to BigQuery, and to the bucket unless --no-bucket
     clean              delete local data so the next run starts fresh
@@ -216,6 +219,7 @@ class KhorosClient:
         self.session = requests.Session()
         self.session.headers["Accept"] = "application/json"
         # Anonymous is fine for public content; only send a key if we have one.
+        self.authenticated = bool(session_key)
         if session_key:
             self.session.headers["li-api-session-key"] = session_key
 
@@ -349,9 +353,9 @@ def extract_author(item):
     """Pull an author record out of a message.
 
     The users collection returns zero rows to anonymous callers, so the only
-    way to get author details is to collect them as we sweep. That is why this
-    table is called message_authors and not users: it covers people who have
-    posted, not everyone registered.
+    way to get author details is to collect them as we sweep. These feed the
+    users table, along with the people found while fetching kudos -- see
+    derive_users. Anyone who registered and never posted or voted is invisible.
     """
     uid = as_int(nested(item, "author", "id"))
     if uid is None:
@@ -393,10 +397,32 @@ def extract_images(item):
     return rows
 
 
-def write_ndjson(path, rows, mode="w"):
+def write_ndjson(path, rows, private=False):
+    """Write rows as newline-delimited JSON, replacing whatever was there.
+
+    Goes via a .partial and renames, so a crash cannot leave a half-written
+    file in place.
+
+    private=True makes the file readable only by its owner. Set it for anything
+    holding email addresses. The permissions are part of the open call rather
+    than a chmod afterwards, so there is no instant at which another user could
+    open the file -- not even an empty one.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
     partial = path.with_suffix(path.suffix + ".partial")
-    with partial.open(mode) as handle:
+
+    # A leftover partial from a crashed run would keep its old permissions,
+    # because the mode below only applies to a file being created. Remove it so
+    # the open really does create.
+    partial.unlink(missing_ok=True)
+
+    # umask can only clear permission bits, never add them, so 0o600 cannot come
+    # out looser than asked. 0o666 lands at the usual 0o644 for everything else.
+    descriptor = os.open(
+        partial, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600 if private else 0o666
+    )
+
+    with os.fdopen(descriptor, "w") as handle:
         for row in rows:
             handle.write(json.dumps(row) + "\n")
     partial.rename(path)
@@ -588,7 +614,16 @@ def all_messages(root):
             yield from read_ndjson_dir(board_dir)
 
 
-def fetch_per_message(client, root, count_field, collection, build_row, out_name, batch=100):
+def fetch_per_message(
+    client,
+    root,
+    count_field,
+    collection,
+    build_row,
+    out_name,
+    batch=100,
+    filter_column="messages.id",
+):
     """Query one collection per message, for messages that have any.
 
     The sweep counted labels, tags and images on every message, so we can skip
@@ -601,6 +636,10 @@ def fetch_per_message(client, root, count_field, collection, build_row, out_name
     already done, so an interrupted run resumes instead of starting over. These
     runs take an hour or more; losing all of it to one failure at the end is not
     an acceptable way to spend an afternoon.
+
+    filter_column is not a nicety: labels, tags and images filter on
+    messages.id, but kudos only accepts message.id, and the wrong one fails
+    every request with "Invalid query syntax".
     """
     out_path = root / "enrich" / out_name
     state_path = root / "enrich" / f"_{out_path.stem}_done.json"
@@ -621,10 +660,16 @@ def fetch_per_message(client, root, count_field, collection, build_row, out_name
     for index, uid in enumerate(remaining, 1):
         # LIMIT is not optional. Without one LiQL quietly returns 25 rows and a
         # cursor, so a message with 79 tags silently yields 25 of them.
-        data = client.query(
-            f"SELECT * FROM {collection} WHERE messages.id = '{uid}' LIMIT {LIQL_LIMIT}"
-        )
-        rows.extend(build_row(uid, item) for item in data.get("items", []))
+        liql = f"SELECT * FROM {collection} WHERE {filter_column} = '{uid}' LIMIT {LIQL_LIMIT}"
+        # And LIMIT caps at 1000, so follow the cursor. Labels and tags never
+        # reach that, but kudos do -- a few messages carry over 4,000.
+        cursor = None
+        while True:
+            items, cursor = client.page(liql, cursor)
+            rows.extend(build_row(uid, item) for item in items)
+            if not cursor:
+                break
+            time.sleep(REQUEST_PAUSE)
         done.add(uid)
         if index % batch == 0:
             save()
@@ -660,6 +705,37 @@ def cmd_fetch_tags(client, args):
             "tag": item.get("text"),
         },
         "message_tags.ndjson",
+    )
+
+
+def cmd_fetch_kudos(client, args):
+    """Fetch who gave each kudo, for every message that has any.
+
+    By far the slowest step: about 26,600 requests against the default boards,
+    producing some 187,000 rows. Everything else in enrich/ is an order of
+    magnitude smaller.
+
+    The larger batch is deliberate. save() rewrites the whole file, so
+    checkpointing every 100 messages would rewrite a thirty-megabyte file
+    hundreds of times. 500 risks about four minutes of work on a failure, which
+    is the better trade at this size.
+    """
+    fetch_per_message(
+        client,
+        Path(args.out),
+        "kudos_weight",
+        "kudos",
+        lambda uid, item: {
+            "message_uid": uid,
+            "kudo_id": as_int(item.get("id")),
+            "user_uid": as_int(nested(item, "user", "id")),
+            "user_login": nested(item, "user", "login"),
+            "kudo_time": item.get("time"),
+            "weight": as_int(item.get("weight")),
+        },
+        "message_kudos.ndjson",
+        batch=500,
+        filter_column="message.id",
     )
 
 
@@ -884,7 +960,10 @@ SCHEMAS = {
         ("url", "STRING"),
         ("source", "STRING"),
     ],
-    "message_authors": [
+    # Everyone we have seen, whether they posted or only voted. The rank, visit
+    # and status columns come from a message's author record, so they are null
+    # for anyone who only ever gave a kudo.
+    "users": [
         ("user_uid", "INTEGER", "REQUIRED"),
         ("login", "STRING"),
         ("view_href", "STRING"),
@@ -894,6 +973,15 @@ SCHEMAS = {
         ("last_visit_time", "TIMESTAMP"),
         ("online_status", "STRING"),
         ("deleted", "BOOLEAN"),
+        ("posted", "BOOLEAN"),
+        ("voted", "BOOLEAN"),
+        # From the users sweep, so null unless fetch-users ran with a key.
+        # sso_identifier is the FxA UID when sso_connection is
+        # oauth2|firefoxaccounts, which is what joins to SUMO's Profile.fxa_uid.
+        ("email", "STRING"),
+        ("sso_id", "STRING"),
+        ("sso_connection", "STRING"),
+        ("sso_identifier", "STRING"),
     ],
     "message_labels": [
         ("message_uid", "INTEGER", "REQUIRED"),
@@ -903,6 +991,14 @@ SCHEMAS = {
         ("message_uid", "INTEGER", "REQUIRED"),
         ("tag_id", "INTEGER"),
         ("tag", "STRING"),
+    ],
+    "message_kudos": [
+        ("message_uid", "INTEGER", "REQUIRED"),
+        ("kudo_id", "INTEGER"),
+        ("user_uid", "INTEGER"),
+        ("user_login", "STRING"),
+        ("kudo_time", "TIMESTAMP"),
+        ("weight", "INTEGER"),
     ],
     "image_files": [
         ("image_id", "STRING", "REQUIRED"),
@@ -1120,6 +1216,149 @@ def check_bucket(bucket):
         )
 
 
+# Proven to work as one SELECT against the live users collection. A single bad
+# field rejects the whole query with no clue which one, so test any addition on
+# its own before adding it here.
+USER_FIELDS = ["id", "login", "email", "sso_id"]
+
+
+def split_sso(sso_id):
+    """Split an Auth0 id into its connection and the identifier it carries.
+
+    They look like <connection>|<provider>|<identifier>, and the last segment
+    is the part worth keeping:
+
+        oauth2|firefoxaccounts|4eda450c...  ->  the suffix is the FxA UID,
+                                                which matches SUMO's fxa_uid
+        google-oauth2|100214065820201232677 ->  a Google id, no use to SUMO
+
+    Returns (connection, identifier), or (None, None) if there is nothing to
+    split.
+    """
+    if not sso_id or "|" not in sso_id:
+        return None, None
+    parts = sso_id.split("|")
+    return "|".join(parts[:-1]), parts[-1]
+
+
+def cmd_fetch_users(client, args):
+    """Sweep every registered account for its email and sso_id.
+
+    Needs an account -- set KHOROS_USER and KHOROS_PASSWORD, or
+    KHOROS_SESSION_KEY. Anonymous callers get an empty list instead of an
+    error, which is why the first empty page is treated as a failure rather
+    than as "no users".
+
+    All of them, not just the people who posted or voted: about 117,000
+    accounts over roughly 117 requests, a couple of minutes. The cursor walks
+    newest first.
+
+    The file holds real email addresses, so it is written owner-only.
+    """
+    root = Path(args.out)
+    rows, cursor, pages = [], None, 0
+    liql = f"SELECT {', '.join(USER_FIELDS)} FROM users LIMIT {LIQL_LIMIT}"
+    print("sweeping every registered account")
+
+    while True:
+        items, cursor = client.page(liql, cursor)
+        pages += 1
+        if pages == 1 and not items:
+            raise SystemExit(
+                "users returned nothing. Anonymous callers get an empty list "
+                "instead of an error, so check KHOROS_USER and KHOROS_PASSWORD."
+            )
+        for item in items:
+            uid = as_int(item.get("id"))
+            if uid is None:
+                continue
+            connection, identifier = split_sso(item.get("sso_id"))
+            rows.append(
+                {
+                    "user_uid": uid,
+                    "login": item.get("login"),
+                    "email": item.get("email"),
+                    "sso_id": item.get("sso_id"),
+                    "sso_connection": connection,
+                    "sso_identifier": identifier,
+                }
+            )
+        if pages % 20 == 0:
+            print(f"  {len(rows)} accounts")
+        if not cursor:
+            break
+        time.sleep(REQUEST_PAUSE)
+
+    out_path = root / "derived" / "connect_users.ndjson"
+    write_ndjson(out_path, rows, private=True)
+    print(f"{len(rows)} accounts written to {out_path} (owner-only)")
+
+
+def derive_users(root):
+    """Build one row per person, from the roster plus what each of them did.
+
+    Three sources, in order of breadth. fetch-users gives the full roster, every
+    registered account, with email and sso_id. Messages add the author details
+    -- rank, last visit, online status -- which the roster does not carry. Kudos
+    say who voted.
+
+    Without a roster on disk we fall back to the people who left a trace, which
+    is all an anonymous export can see. Anyone registered but silent is then
+    missing entirely, rather than present with posted and voted false.
+
+    Returns the path written, or None if there is nothing to write.
+    """
+    roster_path = root / "derived" / "connect_users.ndjson"
+    authors_path = root / "derived" / "message_authors.ndjson"
+    kudos_path = root / "enrich" / "message_kudos.ndjson"
+
+    people = {}
+    for row in read_ndjson(roster_path) if roster_path.exists() else []:
+        people[row["user_uid"]] = {**row, "posted": False, "voted": False}
+    on_roster = len(people)
+    if not on_roster:
+        print("users: no roster on disk, so email and sso_id are left null")
+
+    # Posts fill in the fields only a message's author record carries.
+    posted = 0
+    for author in read_ndjson(authors_path) if authors_path.exists() else []:
+        person = people.setdefault(
+            author["user_uid"], {"user_uid": author["user_uid"], "voted": False}
+        )
+        person.update({k: v for k, v in author.items() if v is not None})
+        person["posted"] = True
+        posted += 1
+
+    if kudos_path.exists():
+        for kudo in read_ndjson(kudos_path):
+            uid = kudo.get("user_uid")
+            if uid is None:
+                continue
+            person = people.setdefault(
+                uid, {"user_uid": uid, "login": kudo.get("user_login"), "posted": False}
+            )
+            person["voted"] = True
+    else:
+        # Without the kudos file we cannot tell a non-voter from an unknown, so
+        # say nothing rather than claim everyone abstained.
+        for person in people.values():
+            person["voted"] = None
+        print("users: no kudos file, so `voted` is left null")
+
+    voted = sum(1 for p in people.values() if p.get("voted"))
+    print(f"users: {on_roster} on the roster, {posted} posted, {voted} voted")
+
+    if not people:
+        return None
+
+    out_path = root / "derived" / "users.ndjson"
+    # Carries the same email addresses as the roster, so lock it down too.
+    write_ndjson(out_path, list(people.values()), private=True)
+    silent = sum(1 for p in people.values() if not p.get("posted") and not p.get("voted"))
+    print(f"users: {len(people)} written, {silent} of whom never posted or voted")
+    return out_path
+
+
 def cmd_load(_client, args):
     root = Path(args.out)
     messages_dir = root / "messages"
@@ -1151,11 +1390,11 @@ def cmd_load(_client, args):
     if recovered.exists():
         image_files.append(recovered)
     bq_load("message_images", image_files, root)
-    author_file = root / "derived" / "message_authors.ndjson"
-    bq_load("message_authors", [author_file] if author_file.exists() else [], root)
+    users_file = derive_users(root)
+    bq_load("users", [users_file] if users_file else [], root)
     manifest = root / "derived" / "image_files.ndjson"
     bq_load("image_files", [manifest] if manifest.exists() else [], root)
-    for table in ("message_labels", "message_tags"):
+    for table in ("message_labels", "message_tags", "message_kudos"):
         path = root / "enrich" / f"{table}.ndjson"
         bq_load(table, [path] if path.exists() else [], root)
 
@@ -1201,9 +1440,19 @@ def cmd_refresh(client, args):
         ("messages", cmd_fetch_messages),
         ("labels", cmd_fetch_labels),
         ("tags", cmd_fetch_tags),
+        ("kudos", cmd_fetch_kudos),
         ("images", cmd_fetch_images),
         ("load into BigQuery and GCS", cmd_load),
     ]
+
+    # The users sweep needs an account. Skipping it loudly beats failing the
+    # whole run, because everything else works fine anonymously -- you just get
+    # a users table with no email and no sso_id.
+    if client.authenticated:
+        steps.insert(5, ("users (email and sso_id)", cmd_fetch_users))
+    else:
+        print("not signed in, so skipping the users sweep.")
+        print("set KHOROS_USER and KHOROS_PASSWORD to get email and sso_id.\n")
 
     started = time.monotonic()
     preflight(args, os.environ.get("KHOROS_DOMAIN", "connect.mozilla.org"))
@@ -1238,15 +1487,66 @@ def cmd_refresh(client, args):
     print(f"\nrefresh finished in {(time.monotonic() - started) / 60:.0f} min")
 
 
-def get_session_key():
-    """A session key from the environment, or None to call the API anonymously.
+def sign_in(domain, login, password):
+    """Trade a username and password for a session key.
 
-    Anonymous covers everything public on Connect, which is all this export
-    needs. A key only buys private boards and full user profiles, and we have
-    never had one -- so if you set KHOROS_SESSION_KEY, expect to find out
-    whether it works.
+    The v2 API has no sign-in endpoint -- this one lives on the older v1 REST
+    API, and v1 reads are gated behind the allow_restapi_call_read permission,
+    so the account needs it. Two limits worth knowing, both enforced here
+    rather than by a confusing API error: the login must be under 15
+    characters, and the password 20 or fewer. The API's own message says
+    "shorter than 20" but means 21 is the first length it rejects.
     """
-    return os.environ.get("KHOROS_SESSION_KEY") or None
+    if len(login) >= 15:
+        raise SystemExit(f"login must be under 15 characters, got {len(login)}")
+    if len(password) > 20:
+        raise SystemExit(f"password must be 20 characters or fewer, got {len(password)}")
+
+    response = requests.post(
+        f"https://{domain}/restapi/vc/authentication/sessions/login",
+        params={"restapi.response_format": "json"},
+        data={"user.login": login, "user.password": password},
+        timeout=30,
+    )
+    response.raise_for_status()
+    body = response.json().get("response", {})
+    if body.get("status") != "success":
+        error = body.get("error", {})
+        raise SystemExit(f"sign-in failed: {error.get('message')} (code {error.get('code')})")
+
+    key = nested(body, "value", "$")
+    if not key:
+        raise SystemExit(f"signed in but found no session key in: {json.dumps(body)[:300]}")
+    return key
+
+
+def get_session_key():
+    """A session key, or None to call the API anonymously.
+
+    Anonymous covers every public board, which is all the content export needs.
+    A key buys the users collection, and with it email and sso_id -- see
+    cmd_fetch_users.
+
+    Either set KHOROS_SESSION_KEY directly, or set KHOROS_USER and
+    KHOROS_PASSWORD and let the script sign in. Keep the password out of your
+    shell history:
+
+        export KHOROS_USER=connectx
+        export KHOROS_PASSWORD=$(security find-generic-password -s khoros -w)
+    """
+    key = os.environ.get("KHOROS_SESSION_KEY")
+    if key:
+        return key
+
+    login = os.environ.get("KHOROS_USER")
+    password = os.environ.get("KHOROS_PASSWORD")
+    if not (login and password):
+        return None
+
+    domain = os.environ.get("KHOROS_DOMAIN", "connect.mozilla.org")
+    key = sign_in(domain, login, password)
+    print(f"signed in as {login}")
+    return key
 
 
 def main():
@@ -1306,6 +1606,12 @@ def main():
 
     subparsers.add_parser("fetch-labels", parents=[common], help="labels per message (slow)")
     subparsers.add_parser("fetch-tags", parents=[common], help="tags per message (slow)")
+    subparsers.add_parser(
+        "fetch-kudos", parents=[common], help="who gave each kudo (slowest step)"
+    )
+    subparsers.add_parser(
+        "fetch-users", parents=[common], help="email and sso_id (needs an account)"
+    )
 
     images = subparsers.add_parser(
         "fetch-images", parents=[common], help="download the image files"
@@ -1352,6 +1658,8 @@ def main():
         "fetch-messages": cmd_fetch_messages,
         "fetch-labels": cmd_fetch_labels,
         "fetch-tags": cmd_fetch_tags,
+        "fetch-kudos": cmd_fetch_kudos,
+        "fetch-users": cmd_fetch_users,
         "fetch-images": cmd_fetch_images,
         "load": cmd_load,
         "clean": cmd_clean,

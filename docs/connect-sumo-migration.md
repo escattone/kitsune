@@ -21,11 +21,14 @@ rather than adding to it, and slugs are case-sensitive (`Labs`, not `labs`).
 | | In scope | Whole export |
 |---|---:|---:|
 | Messages | 89,439 | 94,439 |
-| Distinct posters | 37,231 | — |
-| Everyone who has ever posted (`message_authors`) | — | 40,491 |
+| Distinct posters | 37,231 | 40,491 |
 | Kudos | 186,856 | 217,932 |
 | Messages carrying a kudo | 26,589 | 30,536 |
 | Distinct images | 4,760 | 4,969 |
+
+**Users are not scoped to the boards.** The team decided to import everyone, so
+the `users` table is the whole roster — **117,105 accounts**, about two thirds of
+whom never posted or voted. The `posted` and `voted` flags tell them apart.
 
 Images, attachments and everything else the export already produces comes
 across as-is.
@@ -129,22 +132,21 @@ A per-user vote table would be `(user_uid, message_uid, time)`. The Khoros
 record also gives the voter's login, and **a real timestamp** — unlike tags or
 status, votes are the one place Connect says *when* something happened.
 
-Not exported yet. Costs are known: see
-[What a full kudos export would cost](mozilla-connect.md#what-a-full-kudos-export-would-cost).
-Roughly 30,553 requests and five hours for the whole community; the in-scope
-subset is 26,589 messages.
+Now exported, as `message_kudos` — one row per vote, carrying the voter and a
+timestamp. See [What the kudos export costs](mozilla-connect.md#what-the-kudos-export-costs):
+26,605 requests and six to seven hours, the slowest step by far.
 
-!!! warning "Per-user votes expand the identity problem"
+Two facts that simplify the import:
 
-    Voters are not the same population as posters. Someone who only ever voted
-    has no row in `message_authors` and is invisible in every figure above. We
-    do not know how many such people exist, and we cannot know until the kudos
-    detail is exported.
+- **One vote per person per message, enforced.** On the busiest message, 4,606
+  kudos came from 4,606 distinct accounts. So `SUM(weight)` is a headcount.
+- **No anonymous votes.** Unlike posts, where 1,562 in-scope messages belong to
+  the `Anonymous` placeholder, every vote has a real account behind it. Nothing
+  unattributable to decide about.
 
-    So importing per-user votes means importing users we have not counted, of
-    whom the same ~58% will have no matchable identity. If vote **totals** per
-    message are enough, no voter identities are needed at all and the whole
-    question disappears.
+Importing all users also dissolves what used to be the hard part here: voters
+who never posted are already on the roster, so per-user votes no longer drag in
+people we have not counted.
 
 ## Thread structure has nowhere to land
 
@@ -209,11 +211,13 @@ The alternatives, for the record:
 
 ## Open questions
 
-- **How many of the ~15,600 FxA UIDs already exist in `Profile.fxa_uid`?** The
+- **How many of the FxA UIDs already exist in `Profile.fxa_uid`?** The
   difference between linking existing users and creating most of them. Needs
-  prod access.
-- **Per-user votes, or totals only?** Decide before running the five-hour kudos
-  export, because the answer changes who has to be imported.
+  prod access. Now answerable precisely rather than by sampling, since the
+  roster carries `sso_identifier` for every account.
+- **Does importing 117,105 accounts need a data review?** Two thirds of them
+  never participated, and the table holds their email addresses. Larger
+  footprint than the participant-only plan this doc originally assumed.
 - **`is_fxa_migrated` is only ever set by `create_user`.** Anything the import
   creates must set it deliberately, or those users are invisible to private
   messaging (`kitsune/messages/api.py:40`, `kitsune/users/api.py:71`).
